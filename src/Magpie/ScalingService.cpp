@@ -21,10 +21,21 @@ using winrt::Magpie::ShortcutAction;
 
 namespace Magpie {
 
+// 同时缩放的最大窗口数。每个缩放运行时占用一条线程和一整套 D3D/捕获资源，
+// 无上限时窗口数过多会导致显存与内存压力失控
+static constexpr uint32_t MAX_SCALING_WINDOWS = 4;
+
+// 定义于 Magpie.Core/CursorManager.cpp。Magpie 项目的包含目录只有
+// Magpie.Core/include，无法直接包含 CursorManager.h，因此前向声明。
+void RestoreCursorSpeedIfCrashed() noexcept;
+
 ScalingService::~ScalingService() {}
 
 void ScalingService::Initialize() {
 	// 缩放运行时改为按需创建：每个源窗口一个（见 _GetOrCreateRuntime）
+
+	// 上次若在光标速度被调慢期间异常退出，系统光标速度会停留在调慢值，这里还原
+	RestoreCursorSpeedIfCrashed();
 
 	const DispatcherQueue& dispatcher = App::Get().Dispatcher();
 
@@ -333,6 +344,8 @@ ScalingRuntime& ScalingService::_GetOrCreateRuntime(HWND hWnd) noexcept {
 		rt->StateChanged(
 			std::bind_front(&ScalingService::_ScalingRuntime_StateChanged, this));
 		it = _runtimes.emplace(hWnd, std::move(rt)).first;
+		Logger::Get().Info(fmt::format("为窗口 0x{:X} 创建缩放运行时（当前 {} 个）",
+			(uintptr_t)hWnd, _runtimes.size()));
 	}
 	return *it->second;
 }
@@ -404,6 +417,21 @@ ScalingError ScalingService::_StartScaleImpl(HWND hWnd, const Profile& profile, 
 	if (!force && runtimeIt != _runtimes.end() &&
 		runtimeIt->second->State() == ScalingState::Scaling) {
 		return ScalingError::NoError;
+	}
+
+	// 限制同时缩放的窗口数（force 重启同一窗口时不把该窗口自己算在内）
+	if (!force) {
+		uint32_t scalingCount = 0;
+		for (const auto& kv : _runtimes) {
+			if (kv.first != hWnd && kv.second->State() == ScalingState::Scaling) {
+				++scalingCount;
+			}
+		}
+		if (scalingCount >= MAX_SCALING_WINDOWS) {
+			Logger::Get().Error(fmt::format("已达同时缩放窗口数上限 {}，拒绝缩放新窗口",
+				MAX_SCALING_WINDOWS));
+			return ScalingError::ScalingFailedGeneral;
+		}
 	}
 
 	if (WindowHelper::IsForbiddenSystemWindow(hWnd)) {

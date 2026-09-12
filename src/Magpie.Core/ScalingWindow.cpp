@@ -37,6 +37,13 @@ ScalingWindow& ScalingWindow::Get() noexcept {
 	// 未能绑定的线程（线程池回调等）回退到进程级实例。单例时代这些调用点
 	// 总能拿到窗口，去单例化后若直接解引用 _current 就会访问违例。
 	if (ScalingWindow* fb = _fallback.load(std::memory_order_acquire)) {
+		// 多窗口并存时这里可能解析到错误的实例（不崩溃但行为串窗），记录日志
+		// 以便定位尚未显式绑定的调用点。每线程只记一次避免刷屏。
+		static thread_local bool warned = false;
+		if (!warned) {
+			warned = true;
+			Logger::Get().Warn("ScalingWindow::Get() 在未绑定线程上回退到进程级实例，多窗口下可能解析到错误实例");
+		}
 		return *fb;
 	}
 

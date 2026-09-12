@@ -121,4 +121,8 @@ private:
 	static inline const HCURSOR _hVerticalSizeCursor = LoadCursor(NULL, IDC_SIZENS);
 };
 
+// 检测上次异常退出导致系统光标速度未还原并修复。应在进程启动时调用一次。
+// 声明为自由函数以便其他项目调用（Magpie 项目的包含目录不含本头文件）。
+void RestoreCursorSpeedIfCrashed() noexcept;
+
 }

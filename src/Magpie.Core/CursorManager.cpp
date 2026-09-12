@@ -1,11 +1,13 @@
 #include "pch.h"
 #include "CursorManager.h"
+#include "CommonSharedConstants.h"
 #include "Logger.h"
 #include "Renderer.h"
 #include "ScalingOptions.h"
 #include "ScalingWindow.h"
 #include "Win32Helper.h"
 #include <dwmapi.h>
+#include <fstream>
 #include <magnification.h>
 #include <mutex>
 #include <utility>
@@ -21,6 +23,34 @@ static std::mutex g_cursorSpeedMutex;
 static INT g_originCursorSpeed = 0;	// 0 表示当前没有任何实例处于捕获状态
 // (实例, 调整后的速度)，按调整时间排序，用于在某个实例退出捕获时恢复其他实例的调整值
 static std::vector<std::pair<const void*, INT>> g_adjustedCursorSpeeds;
+
+// 进程在光标速度被调慢期间崩溃的话，系统光标速度会永远停留在调慢值。因此首次调整时
+// 把原始速度写入标记文件，所有实例退出时删除；下次启动若标记仍在，说明上次异常退出，
+// 据此还原（见 RestoreCursorSpeedIfCrashed）。
+static std::wstring _CursorSpeedFlagPath() noexcept {
+	return std::wstring(CommonSharedConstants::LOGS_DIR) + L"\\cursor_speed.flag";
+}
+
+void RestoreCursorSpeedIfCrashed() noexcept {
+	std::ifstream flagFile(_CursorSpeedFlagPath());
+	if (!flagFile) {
+		return;
+	}
+
+	INT originSpeed = 0;
+	if (flagFile >> originSpeed && originSpeed >= 1 && originSpeed <= 20) {
+		if (SystemParametersInfo(SPI_SETMOUSESPEED, 0, (PVOID)(intptr_t)originSpeed, 0)) {
+			Logger::Get().Info(fmt::format("上次异常退出，已还原系统光标速度为 {}", originSpeed));
+		} else {
+			Logger::Get().Win32Error("还原系统光标速度失败");
+		}
+	} else {
+		Logger::Get().Warn("光标速度标记文件无效，已忽略");
+	}
+
+	flagFile.close();
+	DeleteFile(_CursorSpeedFlagPath().c_str());
+}
 
 // 将源窗口的光标位置映射到缩放后的光标位置。当光标位于源窗口之外，与源窗口的距离不会缩放。
 // 对于光标，第一个像素映射到第一个像素，最后一个像素映射到最后一个像素，因此光标区域的缩放
@@ -254,6 +284,14 @@ void CursorManager::_AdjustCursorSpeed() noexcept {
 				Logger::Get().Win32Error("获取光标移速失败");
 				return;
 			}
+
+			// 记录原始速度，供异常退出后恢复（见 RestoreCursorSpeedIfCrashed）
+			std::ofstream flagFile(_CursorSpeedFlagPath(), std::ios::trunc);
+			if (flagFile) {
+				flagFile << g_originCursorSpeed;
+			} else {
+				Logger::Get().Warn("无法写入光标速度标记文件");
+			}
 		}
 		origin = g_originCursorSpeed;
 	}
@@ -327,6 +365,7 @@ void CursorManager::_RestoreCursorSpeed() noexcept {
 			// 所有缩放窗口都已退出捕获状态，还原真正的原始速度
 			speedToSet = g_originCursorSpeed;
 			g_originCursorSpeed = 0;
+			DeleteFile(_CursorSpeedFlagPath().c_str());
 		} else {
 			// 还有其他缩放窗口处于捕获状态，恢复为最近调整的实例的调整值
 			speedToSet = g_adjustedCursorSpeeds.back().second;
