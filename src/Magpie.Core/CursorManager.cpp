@@ -7,8 +7,20 @@
 #include "Win32Helper.h"
 #include <dwmapi.h>
 #include <magnification.h>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 namespace Magpie {
+
+// 系统光标速度是全局的，而每个缩放窗口都有自己的 CursorManager。多窗口并存时若各
+// 实例独立保存/恢复速度，后进入的窗口会把已被调慢的速度当成「原始速度」存下来，在
+// 多个缩放窗口间切换时光标会越来越慢。因此进程内共享「原始速度」和各实例的调整值，
+// 只有所有实例都退出捕获状态才真正还原。
+static std::mutex g_cursorSpeedMutex;
+static INT g_originCursorSpeed = 0;	// 0 表示当前没有任何实例处于捕获状态
+// (实例, 调整后的速度)，按调整时间排序，用于在某个实例退出捕获时恢复其他实例的调整值
+static std::vector<std::pair<const void*, INT>> g_adjustedCursorSpeeds;
 
 // 将源窗口的光标位置映射到缩放后的光标位置。当光标位于源窗口之外，与源窗口的距离不会缩放。
 // 对于光标，第一个像素映射到第一个像素，最后一个像素映射到最后一个像素，因此光标区域的缩放
@@ -233,10 +245,19 @@ void CursorManager::_AdjustCursorSpeed() noexcept {
 		return;
 	}
 
-	if (!SystemParametersInfo(SPI_GETMOUSESPEED, 0, &_originCursorSpeed, 0)) {
-		Logger::Get().Win32Error("获取光标移速失败");
-		return;
+	INT origin = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_cursorSpeedMutex);
+		if (g_originCursorSpeed == 0) {
+			// 第一个进入捕获状态的实例负责读取真实的原始速度
+			if (!SystemParametersInfo(SPI_GETMOUSESPEED, 0, &g_originCursorSpeed, 0)) {
+				Logger::Get().Win32Error("获取光标移速失败");
+				return;
+			}
+		}
+		origin = g_originCursorSpeed;
 	}
+	_originCursorSpeed = origin;
 
 	// 鼠标加速默认打开
 	bool isMouseAccelerationOn = true;
@@ -259,15 +280,15 @@ void CursorManager::_AdjustCursorSpeed() noexcept {
 	// “提高指针精确度”（鼠标加速）打开时光标移速的调整为线性，否则为非线性
 	// 参见 https://liquipedia.net/counterstrike/Mouse_Settings#Windows_Sensitivity
 	if (isMouseAccelerationOn) {
-		newSpeed = std::clamp((INT)lround(_originCursorSpeed / scale), 1, 20);
+		newSpeed = std::clamp((INT)lround(origin / scale), 1, 20);
 	} else {
 		static constexpr std::array<double, 20> SENSITIVITIES = {
 			0.03125, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875,
 			1.0, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5
 		};
 
-		_originCursorSpeed = std::clamp(_originCursorSpeed, 1, 20);
-		double newSensitivity = SENSITIVITIES[static_cast<size_t>(_originCursorSpeed) - 1] / scale;
+		origin = std::clamp(origin, 1, 20);
+		double newSensitivity = SENSITIVITIES[static_cast<size_t>(origin) - 1] / scale;
 
 		auto it = std::lower_bound(SENSITIVITIES.begin(), SENSITIVITIES.end(),
 			newSensitivity - FLOAT_EPSILON<double>);
@@ -283,7 +304,13 @@ void CursorManager::_AdjustCursorSpeed() noexcept {
 
 	if (!SystemParametersInfo(SPI_SETMOUSESPEED, 0, (PVOID)(intptr_t)newSpeed, 0)) {
 		Logger::Get().Win32Error("设置光标移速失败");
+		return;
 	}
+
+	std::lock_guard<std::mutex> lock(g_cursorSpeedMutex);
+	// 已有记录则更新并保持顺序，保证 back() 是最近调整的实例
+	std::erase_if(g_adjustedCursorSpeeds, [this](const auto& p) { return p.first == this; });
+	g_adjustedCursorSpeeds.emplace_back(this, newSpeed);
 }
 
 void CursorManager::_RestoreCursorSpeed() noexcept {
@@ -292,9 +319,23 @@ void CursorManager::_RestoreCursorSpeed() noexcept {
 		return;
 	}
 
-	if (_originCursorSpeed != 0) {
-		SystemParametersInfo(SPI_SETMOUSESPEED, 0, (PVOID)(intptr_t)_originCursorSpeed, 0);
-		_originCursorSpeed = 0;
+	INT speedToSet = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_cursorSpeedMutex);
+		std::erase_if(g_adjustedCursorSpeeds, [this](const auto& p) { return p.first == this; });
+		if (g_adjustedCursorSpeeds.empty()) {
+			// 所有缩放窗口都已退出捕获状态，还原真正的原始速度
+			speedToSet = g_originCursorSpeed;
+			g_originCursorSpeed = 0;
+		} else {
+			// 还有其他缩放窗口处于捕获状态，恢复为最近调整的实例的调整值
+			speedToSet = g_adjustedCursorSpeeds.back().second;
+		}
+	}
+	_originCursorSpeed = 0;
+
+	if (speedToSet != 0) {
+		SystemParametersInfo(SPI_SETMOUSESPEED, 0, (PVOID)(intptr_t)speedToSet, 0);
 	}
 }
 
@@ -330,17 +371,22 @@ void CursorManager::_ReliableSetCursorPos(POINT pos) const noexcept {
 }
 
 winrt::fire_and_forget CursorManager::_SrcHitTestAsync(POINT screenPos) noexcept {
-	const uint32_t runId = ScalingWindow::RunId();
+	const uint32_t runId = ScalingWindow::Get().RunId();
 	const uint32_t id = _nextHitTestId++;
 	const HWND hwndSrc = ScalingWindow::Get().SrcTracker().Handle();
+
+	// resume_background 之后会回到线程池，那里没有绑定的实例，因此提前捕获
+	// 本实例及其 dispatcher 队列
+	ScalingWindow* const scalingWindow = &ScalingWindow::Get();
+	const winrt::DispatcherQueue dispatcher = scalingWindow->Dispatcher();
 
 	co_await winrt::resume_background();
 
 	const int16_t area = Win32Helper::AdvancedWindowHitTest(hwndSrc, screenPos, 100);
 
-	co_await ScalingWindow::Get().Dispatcher();
+	co_await dispatcher;
 
-	if (runId != ScalingWindow::RunId() || id <= _lastCompletedHitTestId) {
+	if (runId != ScalingWindow::Get().RunId() || id <= _lastCompletedHitTestId) {
 		co_return;
 	}
 
