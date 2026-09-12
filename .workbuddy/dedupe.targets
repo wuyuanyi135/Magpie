@@ -1,0 +1,39 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Build-time workaround for the base Windows SDK 10.0.26100.0 XAML compiler bug,
+    when compiling with the older 19041 SDK XAML compiler (to dodge the 26100
+    WMC9999 crash). That 19041 compiler emits conflicting definitions of some x:Bind
+    helper templates (e.g. Get/SetReferenceTypeMember_Header): a correct generic
+    variant and a hard-coded-string variant (PropertyValue::CreateString /
+    unbox_value<hstring>). They share a signature -> C2995. This target strips the
+    bad variant from the freshly generated XamlTypeInfo.g.cpp.
+
+    Ordering (the hard part):
+    * MarkupCompilePass1 AND MarkupCompilePass2 BOTH call CompileXaml and regenerate
+      XamlTypeInfo.g.cpp; neither has Inputs/Outputs, so both always run. Pass2 is the
+      LAST generator. A naive AfterTargets="MarkupCompilePass1;MarkupCompilePass2"
+      COALESCES to fire only after Pass1, so Pass2 then re-emits the duplicates. A
+      naive BeforeTargets="ClCompile" can fire before MarkupCompilePass2 (which is
+      itself a ClCompile-before target), again seeing the stale/duplicate file.
+    * The robust fix: hook BeforeTargets="ClCompile" WITH DependsOnTargets=
+      "MarkupCompilePass2". MSBuild guarantees MarkupCompilePass2 (the final
+      generator) completes immediately before this target, so we dedupe the freshly
+      generated file and ClCompile then consumes the clean version. We also keep
+      AfterTargets="MarkupCompilePass2" as a belt-and-suspenders hook. The dedupe is
+      idempotent, so running it in both places is harmless.
+    * Only the Magpie UI project generates XamlTypeInfo.g.cpp -> gate to that project.
+    * Injected via /p:CustomAfterMicrosoftCommonTargets (CustomAfterMicrosoftCppTargets
+      is NOT honored by the VC toolchain).
+    * The script exits 0 on not-found / no-conflicts / success, so the target can never
+      abort the build.
+  -->
+  <Target Name="DedupeXamlTypeInfoWorkaround"
+          AfterTargets="MarkupCompilePass2"
+          BeforeTargets="ClCompile"
+          DependsOnTargets="MarkupCompilePass2"
+          Condition="'$(MSBuildProjectName)' == 'Magpie'">
+    <Message Text="[workaround] dedupe generated XamlTypeInfo.g.cpp (19041 XAML compiler duplicate-helper bug)" Importance="high" />
+    <Exec Command="&quot;C:\Users\wuyua\.workbuddy\binaries\python\versions\3.13.12\python.exe&quot; &quot;C:\Users\wuyua\Project\Magpie\.workbuddy\dedupe_xamltypeinfo.py&quot; &quot;$(IntDir)Generated Files\XamlTypeInfo.g.cpp&quot;"
+          ContinueOnError="true" />
+  </Target>
+</Project>

@@ -1,0 +1,10 @@
+# 本机构建辅助目录：只跟踪可复现构建所需的脚本
+*
+!.gitignore
+!build.bat
+!build_magpie.py
+!check_ready.py
+!conan_install.bat
+!dedupe.targets
+!dedupe_xamltypeinfo.py
+!run_build.py
