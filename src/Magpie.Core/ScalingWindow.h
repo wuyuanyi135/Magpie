@@ -9,24 +9,87 @@ namespace Magpie {
 
 class CursorManager;
 
-class ScalingWindow final : public BaseWindow<ScalingWindow>, public Singleton<ScalingWindow> {
+class ScalingWindow final : public BaseWindow<ScalingWindow> {
 	using base_type = BaseWindow<ScalingWindow>;
 	friend base_type;
-	friend Singleton<ScalingWindow>;
 
 public:
-	// 用于检查当前缩放是否结束
-	static uint32_t RunId() noexcept {
-		return _runId.load(std::memory_order_relaxed);
+	// 多实例支持。
+	//
+	// ScalingWindow 不再继承 Singleton：单个进程需要同时存在多个缩放窗口，
+	// 才能把多个放大的画面并排摆放。
+	//
+	// 既有代码里有上百处 ScalingWindow::Get()，为免一次性改动引入回归，这里
+	// 保留同名接口，但语义改为「当前上下文关联的那个实例」（见 _current）。
+	// 调用方在执行任何实例相关逻辑前应先用 SetCurrent 绑定，退出时恢复。
+	static ScalingWindow& Get() noexcept;
+
+	// 绑定/解绑「当前实例」。传 nullptr 表示解绑。
+	// 返回上一个值，便于调用方恢复。
+	static ScalingWindow* SetCurrent(ScalingWindow* value) noexcept;
+
+	// 用于检查当前缩放是否结束（每个实例独立）
+	uint32_t RunId() const noexcept {
+		return _runId;
 	}
 
-	static void Dispatcher(const winrt::DispatcherQueue& value) noexcept {
-		_dispatcher = value;
+	void SetDispatcher(const winrt::DispatcherQueue& value) noexcept {
+		_dispatcherQueue = value;
 	}
 
+	// 进程级回退实例，供无法绑定的线程使用
+	static void SetFallback(ScalingWindow* value) noexcept {
+		_fallback.store(value, std::memory_order_release);
+	}
+
+	// 取得当前实例所属线程的 dispatcher 队列
 	static const winrt::DispatcherQueue& Dispatcher() noexcept {
-		return _dispatcher;
+		return Get()._dispatcherQueue;
 	}
+
+	// 为任意专用线程（如 Renderer 的后端渲染线程）绑定实例。
+	// 这类线程同样只服务一个缩放窗口，因此绑定后 ScalingWindow::Get()
+	// 就能正确解析，无需改动调用点。
+	class ThreadBinding {
+	public:
+		explicit ThreadBinding(ScalingWindow& window) noexcept
+			: _prev(SetCurrent(&window)) {
+		}
+
+		~ThreadBinding() noexcept {
+			SetCurrent(_prev);
+		}
+
+		ThreadBinding(const ThreadBinding&) = delete;
+		ThreadBinding(ThreadBinding&&) = delete;
+
+	private:
+		ScalingWindow* _prev;
+	};
+
+	// RAII：为当前线程创建一个归本线程所有的缩放窗口，并绑定为「当前实例」；
+	// 离开作用域时自动解绑并销毁。
+	//
+	// 多实例的支撑点：每个 ScalingRuntime 都有自己专用的 dispatcher 线程，
+	// 且所有窗口操作都经 TryEnqueue 投递到该线程执行。因此把实例绑定到线程
+	// 上，既有代码里上百处 ScalingWindow::Get() 无需任何改动就能拿到属于本
+	// 线程的那个实例。
+	class ThreadInstance {
+	public:
+		ThreadInstance() noexcept;
+		~ThreadInstance() noexcept;
+
+		ThreadInstance(const ThreadInstance&) = delete;
+		ThreadInstance(ThreadInstance&&) = delete;
+
+		ScalingWindow& Get() noexcept {
+			return *_window;
+		}
+
+	private:
+		std::unique_ptr<ScalingWindow> _window;
+		ScalingWindow* _prev = nullptr;
+	};
 
 	void Start(HWND hwndSrc, ScalingOptions&& options) noexcept;
 
@@ -92,13 +155,14 @@ public:
 		_options.showError(_srcTracker.Handle(), error);
 	}
 
+	// 由 ScalingRuntime 持有，因此构造与析构必须公开
+	ScalingWindow() noexcept;
+	~ScalingWindow() noexcept;
+
 protected:
 	LRESULT _MessageHandler(UINT msg, WPARAM wParam, LPARAM lParam) noexcept;
 
 private:
-	ScalingWindow() noexcept;
-	~ScalingWindow() noexcept;
-
 	ScalingError _StartImpl(HWND hwndSrc) noexcept;
 
 	// 确保渲染窗口长宽比不变，且限制最小和最大尺寸。必须提供 width 和 height 之一，另一个
@@ -163,8 +227,24 @@ private:
 
 	void _DelayedStop(bool onSrcHung = false, bool onSrcRepositioning = false) const noexcept;
 
-	static inline std::atomic<uint32_t> _runId = 0;
-	static inline winrt::DispatcherQueue _dispatcher{ nullptr };
+	// 未绑定线程上的回退实例：Magpie 里大量 ScalingWindow::Get() 调用发生在
+	// 并非缩放线程的地方（线程池回调、第三方回调等），单例时代它们总能拿到
+	// 窗口，去单例化后必须有一个进程级回退，否则就是解引用空指针（0xC0000005）。
+	// 多窗口并存时回退只能给出其中一个实例，因此凡是能确定归属的线程都应通过
+	// ThreadInstance / ThreadBinding 显式绑定。
+	static inline std::atomic<ScalingWindow*> _fallback = nullptr;
+
+	// 没有任何实例时的最后兜底，避免解引用空指针。它不代表一个真实窗口，
+	// 走到这里说明调用时机有误。
+	static ScalingWindow& _NullInstance() noexcept;
+
+	// 「当前上下文实例」，见 Get()/SetCurrent()。每线程独立：缩放线程与后端
+	// 渲染线程各自绑定自己的实例，未能绑定的线程走 _fallback。
+	static inline thread_local ScalingWindow* _current = nullptr;
+
+	winrt::DispatcherQueue _dispatcherQueue{ nullptr };
+
+	uint32_t _runId = 0;
 
 	RECT _windowRect{};
 	RECT _rendererRect{};

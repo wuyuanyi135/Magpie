@@ -146,6 +146,8 @@ static std::wstring GetCacheFileName(const std::wstring_view& language, uint32_t
 }
 
 void ImGuiFontsCacheManager::Save(std::wstring_view language, uint32_t dpi, const ImFontAtlas& fontAltas) noexcept {
+	std::lock_guard<std::mutex> lock(_mutex);
+
 	std::vector<uint8_t>& buffer = _cacheMap[dpi];
 	buffer.clear();
 	buffer.reserve(1024);
@@ -173,6 +175,8 @@ void ImGuiFontsCacheManager::Save(std::wstring_view language, uint32_t dpi, cons
 }
 
 bool ImGuiFontsCacheManager::Load(std::wstring_view language, uint32_t dpi, ImFontAtlas& fontAltas) noexcept {
+	std::lock_guard<std::mutex> lock(_mutex);
+
 	const std::vector<uint8_t>* pBuffer = nullptr;
 
 	// 先在内存缓存中查找，然后是磁盘缓存

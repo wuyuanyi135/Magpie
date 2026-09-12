@@ -32,7 +32,7 @@ namespace Magpie {
 // 大多数时候会在最后添加 Bicubic 来降采样或升采样，因此缓存在内存中
 static EffectDesc bicubicDesc;
 
-Renderer::Renderer() noexcept {}
+Renderer::Renderer(class ScalingWindow& owner) noexcept : _owner(owner) {}
 
 Renderer::~Renderer() noexcept {
 	_hKeyboardHook.reset();
@@ -781,6 +781,10 @@ void Renderer::_BackendThreadProc() noexcept {
 
 	winrt::init_apartment(winrt::apartment_type::single_threaded);
 
+	// 后端线程只服务本 Renderer 所属的缩放窗口，绑定到线程上后该线程里的
+	// ScalingWindow::Get() 就能拿到正确的实例（渲染主循环每帧都会用到）
+	ScalingWindow::ThreadBinding threadBinding(_owner);
+
 	if (const HANDLE sharedHandle = _InitBackend()) {
 		_sharedTextureHandle.store(sharedHandle, std::memory_order_release);
 		_sharedTextureHandle.notify_one();
@@ -1257,13 +1261,13 @@ LRESULT CALLBACK Renderer::_LowLevelKeyboardHook(int nCode, WPARAM wParam, LPARA
 			renderer._cursorDrawer.IsCursorVisible(false);
 			renderer._FrontendRender();
 
-			const uint32_t runId = ScalingWindow::RunId();
+			const uint32_t runId = ScalingWindow::Get().RunId();
 
 			winrt::DispatcherQueue dispatcher = ScalingWindow::Dispatcher();
 			co_await 200ms;
 			co_await dispatcher;
 
-			if (ScalingWindow::RunId() == runId &&
+			if (ScalingWindow::Get().RunId() == runId &&
 				!renderer._cursorDrawer.IsCursorVisible()
 			) {
 				renderer._cursorDrawer.IsCursorVisible(true);

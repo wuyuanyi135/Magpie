@@ -11,10 +11,13 @@
 namespace Magpie {
 
 class FrameSourceBase;
+class ScalingWindow;
 
 class Renderer {
 public:
-	Renderer() noexcept;
+	// owner 是本 Renderer 所属的缩放窗口。后端渲染线程需要据此绑定实例，
+	// 使线程上的 ScalingWindow::Get() 解析到正确的窗口。
+	explicit Renderer(class ScalingWindow& owner) noexcept;
 	~Renderer() noexcept;
 
 	Renderer(const Renderer&) = delete;
@@ -104,6 +107,9 @@ private:
 
 	// 只能由前台线程访问
 	DeviceResources _frontendResources;
+	// 所属的缩放窗口
+	class ScalingWindow& _owner;
+
 	std::unique_ptr<PresenterBase> _presenter;
 	
 	CursorDrawer _cursorDrawer;

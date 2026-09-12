@@ -28,6 +28,50 @@ ScalingWindow::~ScalingWindow() noexcept {
 	Destroy();
 }
 
+ScalingWindow& ScalingWindow::Get() noexcept {
+	// 优先使用本线程绑定的实例；缩放线程与后端渲染线程都会显式绑定。
+	if (_current) {
+		return *_current;
+	}
+
+	// 未能绑定的线程（线程池回调等）回退到进程级实例。单例时代这些调用点
+	// 总能拿到窗口，去单例化后若直接解引用 _current 就会访问违例。
+	if (ScalingWindow* fb = _fallback.load(std::memory_order_acquire)) {
+		return *fb;
+	}
+
+	assert(false);
+	return _NullInstance();
+}
+
+ScalingWindow& ScalingWindow::_NullInstance() noexcept {
+	static ScalingWindow instance;
+	return instance;
+}
+
+ScalingWindow* ScalingWindow::SetCurrent(ScalingWindow* value) noexcept {
+	ScalingWindow* prev = _current;
+	_current = value;
+	return prev;
+}
+
+ScalingWindow::ThreadInstance::ThreadInstance() noexcept {
+	_window = std::make_unique<ScalingWindow>();
+	_prev = ScalingWindow::SetCurrent(_window.get());
+
+	// 第一个实例作为进程级回退
+	ScalingWindow* expected = nullptr;
+	_fallback.compare_exchange_strong(expected, _window.get(), std::memory_order_acq_rel);
+}
+
+ScalingWindow::ThreadInstance::~ThreadInstance() noexcept {
+	ScalingWindow* self = _window.get();
+	ScalingWindow::SetCurrent(_prev);
+
+	ScalingWindow* expected = self;
+	_fallback.compare_exchange_strong(expected, _prev, std::memory_order_acq_rel);
+}
+
 static void LogRects(const RECT& srcRect, const RECT& rendererRect, const RECT& windowRect) noexcept {
 	Logger::Get().Info(fmt::format("源矩形: {},{},{},{} ({}x{})",
 		srcRect.left, srcRect.top, srcRect.right, srcRect.bottom,
@@ -77,7 +121,9 @@ ScalingError ScalingWindow::_StartImpl(HWND hwndSrc) noexcept {
 		}
 	}
 
-	if (FindWindow(CommonSharedConstants::SCALING_WINDOW_CLASS_NAME, nullptr)) {
+	// 只检查本实例：多窗口并列时允许同时存在多个缩放窗口，原先的全局
+	// FindWindow 会拒绝第二个窗口（错误码 10）
+	if (Handle()) {
 		Logger::Get().Error("已存在缩放窗口");
 		return ScalingError::ScalingFailedGeneral;
 	}
@@ -303,7 +349,7 @@ ScalingError ScalingWindow::_StartImpl(HWND hwndSrc) noexcept {
 		}
 	}
 
-	_renderer = std::make_unique<class Renderer>();
+	_renderer = std::make_unique<class Renderer>(*this);
 	ScalingError error = _renderer->Initialize(_hwndRenderer, _options.overlayOptions);
 	if (error != ScalingError::NoError) {
 		Logger::Get().Error("初始化 Renderer 失败");
@@ -1239,18 +1285,18 @@ void ScalingWindow::_Show() noexcept {
 	// 模拟独占全屏
 	if (_options.IsSimulateExclusiveFullscreen()) {
 		// 延迟 1s 以避免干扰游戏的初始化，见 #495
-		([]()->winrt::fire_and_forget {
-			const uint32_t runId = RunId();
+		([this]()->winrt::fire_and_forget {
+			const uint32_t runId = _runId;
 
 			co_await 1s;
 			co_await Dispatcher();
 
-			if (RunId() != runId) {
+			if (_runId != runId) {
 				co_return;
 			}
 
-			if (!Get()._exclModeMutex) {
-				Get()._exclModeMutex = ExclModeHelper::EnterExclMode();
+			if (!_exclModeMutex) {
+				_exclModeMutex = ExclModeHelper::EnterExclMode();
 			}
 		})();
 	};
@@ -1930,7 +1976,7 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 				}
 
 				if (isInBackground) {
-					co_await ScalingWindow::Get().Dispatcher();
+					co_await ScalingWindow::Dispatcher();
 
 					// 等待时源窗口重新回到前台了应放弃后续操作
 					if (runId != ScalingWindow::RunId() || _srcTracker.IsFocused()) {
@@ -2143,13 +2189,15 @@ void ScalingWindow::_DelayedStop(bool onSrcHung, bool onSrcRepositioning) const 
 	}
 
 	// 延迟销毁可以避免中间状态
-	_dispatcher.TryEnqueue([runId(RunId()), onSrcRepositioning]() {
-		if (runId == RunId()) {
+	// _DelayedStop 是 const 成员，这里需要一份非 const 的 this
+	ScalingWindow* const self = const_cast<ScalingWindow*>(this);
+	Dispatcher().TryEnqueue([self, runId(_runId), onSrcRepositioning]() {
+		if (runId == self->_runId) {
 			if (onSrcRepositioning) {
-				ScalingWindow::Get()._isSrcRepositioning = true;
-				ScalingWindow::Get().Destroy();
+				self->_isSrcRepositioning = true;
+				self->Destroy();
 			} else {
-				ScalingWindow::Get().Stop();
+				self->Stop();
 			}
 		}
 	});

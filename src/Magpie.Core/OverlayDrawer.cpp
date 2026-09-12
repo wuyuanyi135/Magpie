@@ -44,6 +44,9 @@ bool OverlayDrawer::Initialize(DeviceResources& deviceResources, OverlayOptions&
 	_overlayOptions = &overlayOptions;
 	SetDefaultWindowOptions(overlayOptions.windows);
 
+	// 覆盖后面所有 ImGui 调用（含 _imguiImpl 内部的可重入加锁）
+	auto imGuiLock = _imguiImpl.LockContext();
+
 	if (!_imguiImpl.Initialize(deviceResources)) {
 		Logger::Get().Error("初始化 ImGuiImpl 失败");
 		return false;
@@ -84,6 +87,10 @@ void OverlayDrawer::Draw(
 	const SmallVector<float>& effectTimings,
 	POINT drawOffset
 ) noexcept {
+	// 覆盖整个绘制序列：NewFrame → 各 UI → EndFrame → Render，中途不能放锁，
+	// 否则其他缩放窗口的线程会把「当前上下文」切换走。
+	auto imGuiLock = _imguiImpl.LockContext();
+
 	// 所有窗口都不可见则跳过 ImGui 绘制
 	if (!AnyVisibleWindow()) {
 		return;
@@ -251,6 +258,9 @@ static const std::wstring& GetSystemFontsFolder() noexcept {
 }
 
 bool OverlayDrawer::_BuildFonts() noexcept {
+	// 保护对共享字体缓存（ImGuiFontsCacheManager）与本实例上下文的访问
+	auto imGuiLock = _imguiImpl.LockContext();
+
 	const std::wstring& language = GetAppLanguage();
 	ImFontAtlas& fontAtlas = *ImGui::GetIO().Fonts;
 
@@ -896,8 +906,8 @@ bool OverlayDrawer::_DrawToolbar(uint32_t fps, int& itemId) noexcept {
 			});
 		}
 		if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-			ScalingWindow::Dispatcher().TryEnqueue([this, runId(ScalingWindow::RunId())]() {
-				if (runId == ScalingWindow::RunId()) {
+			ScalingWindow::Dispatcher().TryEnqueue([this, runId(ScalingWindow::Get().RunId())]() {
+				if (runId == ScalingWindow::Get().RunId()) {
 					ToolbarState(ToolbarState::Off);
 					ScalingWindow::Get().Renderer().Render(true);
 				}

@@ -24,9 +24,7 @@ namespace Magpie {
 ScalingService::~ScalingService() {}
 
 void ScalingService::Initialize() {
-	_scalingRuntime.emplace();
-	_scalingRuntime->StateChanged(
-		std::bind_front(&ScalingService::_ScalingRuntime_StateChanged, this));
+	// 缩放运行时改为按需创建：每个源窗口一个（见 _GetOrCreateRuntime）
 
 	const DispatcherQueue& dispatcher = App::Get().Dispatcher();
 
@@ -47,13 +45,9 @@ void ScalingService::Initialize() {
 }
 
 void ScalingService::Uninitialize() noexcept {
-	if (!_scalingRuntime) {
-		return;
-	}
-
 	_checkForegroundTimer.Stop();
 	_countDownTimer.Stop();
-	_scalingRuntime.reset();
+	_runtimes.clear();
 
 	_shortcutActivatedRevoker.Revoke();
 }
@@ -92,7 +86,13 @@ double ScalingService::SecondsLeft() const noexcept {
 
 bool ScalingService::IsScaling() const noexcept {
 	// 等待状态视为未缩放
-	return _scalingRuntime->State() == ScalingState::Scaling;
+	// 任一源窗口正在缩放即视为正在缩放
+	for (const auto& [hwnd, rt] : _runtimes) {
+		if (rt->State() == ScalingState::Scaling) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void ScalingService::CheckForeground() {
@@ -107,22 +107,44 @@ void ScalingService::_ShortcutService_ShortcutPressed(ShortcutAction action) {
 	{
 		const bool isWindowdMode = action == ShortcutAction::WindowedModeScale;
 
-		if (_scalingRuntime->State() == ScalingState::Scaling) {
-			_scalingRuntime->ToggleScaling(isWindowdMode);
+		// 多窗口并列：每个源窗口各自一个运行时。若当前前台窗口已在缩放则停止它
+		// （其余窗口不受影响），否则为它启动缩放，从而实现多个窗口同时放大。
+		HWND hwndFore = GetForegroundWindow();
+		if (!hwndFore) {
+			break;
+		}
+
+		// 全屏缩放时前台窗口往往是我们的缩放窗口本身，此时应视为它的源窗口，
+		// 否则会误以为要对缩放窗口再做一次缩放
+		for (const auto& kv : _runtimes) {
+			const HWND hwndScaling = kv.second->ScalingWindowHandle();
+			if (hwndScaling && hwndScaling == hwndFore) {
+				hwndFore = kv.first;
+				break;
+			}
+		}
+
+		auto it = _runtimes.find(hwndFore);
+		if (it != _runtimes.end() && it->second->State() == ScalingState::Scaling) {
+			it->second->Stop();
 		} else {
-			_ScaleForegroundWindow(isWindowdMode);
+			_ScaleForegroundWindow(isWindowdMode, hwndFore);
 		}
 
 		break;
 	}
 	case ShortcutAction::Toolbar:
 	{
-		_scalingRuntime->SwitchToolbarState();
+		if (ScalingRuntime* rt = _ActiveRuntime()) {
+			rt->SwitchToolbarState();
+		}
 		break;
 	}
 	case ShortcutAction::TakeScreenshot:
 	{
-		_scalingRuntime->TakeScreenshot();
+		if (ScalingRuntime* rt = _ActiveRuntime()) {
+			rt->TakeScreenshot();
+		}
 		break;	
 	}
 	default:
@@ -252,6 +274,15 @@ void ScalingService::_CheckForegroundTimer_Tick(winrt::DispatcherQueueTimer cons
 		return;
 	}
 
+	// 前台窗口是我们自己的缩放窗口时不触发自动缩放
+	for (const auto& kv : _runtimes) {
+		const HWND hwndScaling = kv.second->ScalingWindowHandle();
+		if (hwndScaling && hwndScaling == hwndFore) {
+			_hwndChecked = hwndFore;
+			return;
+		}
+	}
+
 	if (hwndFore != _hwndCurSrc) {
 		// 检查自动缩放
 		const Profile* profile = ProfileService::Get().GetProfileForWindow(hwndFore, true);
@@ -291,8 +322,64 @@ void ScalingService::_ScalingRuntime_StateChanged(ScalingState value) {
 	});
 }
 
-void ScalingService::_ScaleForegroundWindow(bool windowedMode) {
-	const HWND hWnd = GetForegroundWindow();
+ScalingRuntime& ScalingService::_GetOrCreateRuntime(HWND hWnd) noexcept {
+	// 每个 runtime 都占有一条线程，源窗口销毁后应及时回收，否则线程数会
+	// 随使用次数一直增长
+	_RecycleIdleRuntimes();
+
+	auto it = _runtimes.find(hWnd);
+	if (it == _runtimes.end()) {
+		auto rt = std::make_unique<ScalingRuntime>();
+		rt->StateChanged(
+			std::bind_front(&ScalingService::_ScalingRuntime_StateChanged, this));
+		it = _runtimes.emplace(hWnd, std::move(rt)).first;
+	}
+	return *it->second;
+}
+
+void ScalingService::_RecycleIdleRuntimes() noexcept {
+	// 析构 runtime 会等待缩放线程退出并泵送消息队列，可能被重入
+	if (_recycling) {
+		return;
+	}
+	_recycling = true;
+
+	for (auto it = _runtimes.begin(); it != _runtimes.end();) {
+		const HWND hwndSrc = it->first;
+		if (IsWindow(hwndSrc) || it->second->State() != ScalingState::Idle) {
+			++it;
+			continue;
+		}
+
+		// 析构 runtime 会等待它的缩放线程退出，期间需要处理消息队列
+		it = _runtimes.erase(it);
+		Logger::Get().Info("已回收空闲的缩放运行时");
+	}
+
+	_recycling = false;
+}
+
+ScalingRuntime* ScalingService::_ActiveRuntime() noexcept {
+	if (_hwndCurSrc) {
+		auto it = _runtimes.find(_hwndCurSrc);
+		if (it != _runtimes.end()) {
+			return it->second.get();
+		}
+	}
+
+	// 回退到任一正在缩放的运行时
+	for (auto& [hwnd, rt] : _runtimes) {
+		if (rt->State() == ScalingState::Scaling) {
+			return rt.get();
+		}
+	}
+	return nullptr;
+}
+
+void ScalingService::_ScaleForegroundWindow(bool windowedMode, HWND hWnd) {
+	if (!hWnd) {
+		hWnd = GetForegroundWindow();
+	}
 	if (!hWnd) {
 		return;
 	}
@@ -312,7 +399,10 @@ void ScalingService::_StartScale(HWND hWnd, const Profile& profile, bool windowe
 
 ScalingError ScalingService::_StartScaleImpl(HWND hWnd, const Profile& profile, bool windowedMode, bool force) {
 	// ScalingRuntime::Start 会检查是否正在缩放，这里提前检查以避免无效操作
-	if (!force && _scalingRuntime->State() == ScalingState::Scaling) {
+	// 只判断"这个源窗口"自己的运行时，其它窗口的缩放不受影响
+	auto runtimeIt = _runtimes.find(hWnd);
+	if (!force && runtimeIt != _runtimes.end() &&
+		runtimeIt->second->State() == ScalingState::Scaling) {
 		return ScalingError::NoError;
 	}
 
@@ -491,7 +581,7 @@ ScalingError ScalingService::_StartScaleImpl(HWND hWnd, const Profile& profile, 
 		);
 	};
 
-	if (!_scalingRuntime->Start(hWnd, std::move(options), force)) {
+	if (!_GetOrCreateRuntime(hWnd).Start(hWnd, std::move(options), force)) {
 		return ScalingError::ScalingFailedGeneral;
 	}
 

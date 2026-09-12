@@ -67,6 +67,10 @@ bool ScalingRuntime::Start(HWND hwndSrc, ScalingOptions&& options, bool force) {
 		// 初始化时视为处于缩放状态
 		_State(ScalingState::Scaling);
 		scalingWindow.Start(hwndSrc, std::move(options));
+
+		_hwndScaling.store(scalingWindow.Handle(), std::memory_order_release);
+		// 让进程级回退指向最近启动的窗口
+		ScalingWindow::SetFallback(&scalingWindow);
 	});
 
 	return true;
@@ -97,8 +101,9 @@ void ScalingRuntime::TakeScreenshot() {
 }
 
 void ScalingRuntime::Stop() {
-	_Dispatcher().TryEnqueue([]() {
+	_Dispatcher().TryEnqueue([this]() {
 		ScalingWindow::Get().Stop();
+		_hwndScaling.store(NULL, std::memory_order_release);
 	});
 }
 
@@ -164,8 +169,12 @@ void ScalingRuntime::_ScalingThreadProc() noexcept {
 		_dispatcherInitialized.notify_one();
 	}
 
-	ScalingWindow& scalingWindow = ScalingWindow::Get();
-	ScalingWindow::Dispatcher(_dispatcher);
+	// 本线程专属的缩放窗口：创建并绑定为「当前实例」（见 ScalingWindow::ThreadInstance）。
+	// 绑定之后，本线程里既有代码的 ScalingWindow::Get() 拿到的就是本运行时的窗口，
+	// 这正是多实例得以成立的关键——每个 ScalingRuntime 有独立的线程。
+	ScalingWindow::ThreadInstance scalingWindowInstance;
+	ScalingWindow& scalingWindow = scalingWindowInstance.Get();
+	scalingWindow.SetDispatcher(_dispatcher);
 
 	time_point<steady_clock> lastRenderTime;
 
@@ -182,6 +191,12 @@ void ScalingRuntime::_ScalingThreadProc() noexcept {
 			}
 
 			DispatchMessage(&msg);
+		}
+
+		// 供 ScalingService 把缩放窗口句柄映射回源窗口（快捷键判断用）
+		const HWND hwndScaling = scalingWindow.Handle();
+		if (hwndScaling != _hwndScaling.load(std::memory_order_relaxed)) {
+			_hwndScaling.store(hwndScaling, std::memory_order_release);
 		}
 
 		if (scalingWindow) {

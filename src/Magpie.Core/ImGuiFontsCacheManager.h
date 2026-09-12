@@ -1,6 +1,7 @@
 #pragma once
 #include "Singleton.h"
 #include <imgui.h>
+#include <mutex>
 #include <parallel_hashmap/phmap.h>
 
 namespace Magpie {
@@ -15,6 +16,9 @@ public:
 
 private:
 	ImGuiFontsCacheManager() = default;
+
+	// 多个缩放窗口会在各自线程上并发读写内存缓存
+	std::mutex _mutex;
 
 	// dpi -> 字体数据
 	phmap::flat_hash_map<uint32_t, std::vector<uint8_t>> _cacheMap;

@@ -28,6 +28,12 @@ public:
 		return _state.load(std::memory_order_relaxed);
 	}
 
+	// 当前缩放窗口的句柄，没有则为 NULL。供外部（如快捷键处理）把缩放窗口
+	// 映射回源窗口。
+	HWND ScalingWindowHandle() const noexcept {
+		return _hwndScaling.load(std::memory_order_acquire);
+	}
+
 	// 调用者应处理线程同步
 	MultithreadEvent<ScalingState> StateChanged;
 
@@ -47,6 +53,8 @@ private:
 	bool _dispatcherInitializedCache = false;
 
 	std::atomic<ScalingState> _state = ScalingState::Idle;
+	// 由缩放线程维护
+	std::atomic<HWND> _hwndScaling = NULL;
 };
 
 }

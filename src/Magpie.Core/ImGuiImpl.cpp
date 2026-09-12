@@ -14,6 +14,10 @@
 
 namespace Magpie {
 
+// 见 ImGuiImpl::LockContext() 的说明：GImGui 是进程全局的，多个缩放窗口并存时所有
+// ImGui 操作必须串行化。使用可重入锁，以便在已持锁的调用序列中嵌套调用各方法。
+static std::recursive_mutex g_imguiMutex;
+
 static bool operator==(const ImVec2& l, const ImVec2& r) noexcept {
 	return l.x == r.x && l.y == r.y;
 }
@@ -31,13 +35,28 @@ static const char* GetWindowIDFromName(const char* name) noexcept {
 	}
 }
 
+std::unique_lock<std::recursive_mutex> ImGuiImpl::LockContext() const noexcept {
+	std::unique_lock<std::recursive_mutex> lock(g_imguiMutex);
+	if (_ctx) {
+		ImGui::SetCurrentContext(_ctx);
+	}
+	return lock;
+}
+
 ImGuiImpl::~ImGuiImpl() noexcept {
-	if (ImGui::GetCurrentContext()) {
-		ImGui::DestroyContext();
+	auto lock = LockContext();
+
+	// 必须显式传入本实例的上下文：ImGui::DestroyContext() 的无参版本销毁的是「当前」
+	// 上下文，多窗口下那可能是别的窗口的上下文。
+	if (_ctx) {
+		ImGui::DestroyContext(_ctx);
+		_ctx = nullptr;
 	}
 }
 
 bool ImGuiImpl::Initialize(DeviceResources& deviceResources) noexcept {
+	auto lock = LockContext();
+
 #ifdef _DEBUG
 	// 检查 ImGUI 版本是否匹配
 	if (!IMGUI_CHECKVERSION()) {
@@ -46,7 +65,12 @@ bool ImGuiImpl::Initialize(DeviceResources& deviceResources) noexcept {
 	}
 #endif
 
-	ImGui::CreateContext();
+	if (_ctx) {
+		ImGui::DestroyContext(_ctx);
+	}
+
+	// CreateContext 会顺便把新上下文设为当前上下文
+	_ctx = ImGui::CreateContext();
 
 	ImGuiIO& io = ImGui::GetIO();
 	io.BackendPlatformName = "Magpie";
@@ -67,6 +91,7 @@ bool ImGuiImpl::Initialize(DeviceResources& deviceResources) noexcept {
 }
 
 bool ImGuiImpl::BuildFonts() noexcept {
+	auto lock = LockContext();
 	return _backend.BuildFonts();
 }
 
@@ -75,6 +100,8 @@ void ImGuiImpl::NewFrame(
 	float fittsLawAdjustment,
 	float dpiScale
 ) noexcept {
+	auto lock = LockContext();
+
 	ImGuiIO& io = ImGui::GetIO();
 
 	{
@@ -216,6 +243,8 @@ void ImGuiImpl::NewFrame(
 }
 
 void ImGuiImpl::Draw(POINT drawOffset) noexcept {
+	auto lock = LockContext();
+
 	ImGui::Render();
 
 	const RECT& rendererRect = ScalingWindow::Get().RendererRect();
@@ -233,6 +262,8 @@ void ImGuiImpl::Tooltip(
 	const char* description,
 	float maxWidth
 ) noexcept {
+	auto lock = LockContext();
+
 	static constexpr float DESCRIPTION_SCALE = 0.9f;
 
 	ImVec2 padding = ImGui::GetStyle().WindowPadding;
@@ -314,6 +345,8 @@ void ImGuiImpl::_UpdateMousePos(float fittsLawAdjustment) noexcept {
 }
 
 void ImGuiImpl::ClearStates() noexcept {
+	auto lock = LockContext();
+
 	ImGuiIO& io = ImGui::GetIO();
 	io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
 	std::fill(std::begin(io.MouseDown), std::end(io.MouseDown), false);
@@ -334,6 +367,8 @@ void ImGuiImpl::ClearStates() noexcept {
 }
 
 void ImGuiImpl::MessageHandler(UINT msg, WPARAM wParam, LPARAM /*lParam*/) noexcept {
+	auto lock = LockContext();
+
 	ImGuiIO& io = ImGui::GetIO();
 	
 	if (!io.WantCaptureMouse) {
@@ -377,6 +412,8 @@ void ImGuiImpl::MessageHandler(UINT msg, WPARAM wParam, LPARAM /*lParam*/) noexc
 }
 
 std::optional<ImVec4> ImGuiImpl::GetWindowRect(const char* id) const noexcept {
+	auto lock = LockContext();
+
 	const std::string suffix = StrHelper::Concat("##", id);
 	for (ImGuiWindow* window : ImGui::GetCurrentContext()->Windows) {
 		if (std::string_view(window->Name).ends_with(suffix)) {
@@ -393,6 +430,8 @@ std::optional<ImVec4> ImGuiImpl::GetWindowRect(const char* id) const noexcept {
 }
 
 const char* ImGuiImpl::GetHoveredWindowId() const noexcept {
+	auto lock = LockContext();
+
 	const ImVec2 mousePos = ImGui::GetIO().MousePos;
 	// 自顶向下遍历
 	for (ImGuiWindow* window : ImGui::GetCurrentContext()->Windows | std::views::reverse) {
