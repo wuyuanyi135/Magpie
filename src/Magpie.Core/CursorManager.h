@@ -80,9 +80,20 @@ private:
 
 	void _UpdateCursorPos() noexcept;
 
-	void _StartCapture(POINT& cursorPos, std::string_view reason = {}) noexcept;
+	// 返回是否已进入捕获状态。多窗口下同一时刻只允许一个缩放窗口捕获光标，
+	// 失败时通过 blockReason 给出让行原因（指向静态字符串，供诊断日志使用）
+	bool _StartCapture(
+		POINT& cursorPos,
+		std::string_view reason = {},
+		std::string_view* blockReason = nullptr
+	) noexcept;
 
 	bool _StopCapture(POINT& cursorPos, bool onDestroy = false, std::string_view reason = {}) noexcept;
+
+	// 捕获期间缩放窗口点击穿透，鼠标消息会落到该点最上面的窗口。如果别的窗口盖住了源窗口，
+	// 点击就会激活那个窗口（多客户端时表现为「一小块区域变成别的客户端」）。这里把源窗口
+	// 抬到最前，除非覆盖它的是用户当前正在使用的窗口
+	void _EnsureSourceNotCovered(POINT srcPos) noexcept;
 
 	void _SetClipCursor(const RECT& clipRect, bool is3DGameMode = false) noexcept;
 
@@ -124,16 +135,19 @@ private:
 	bool _isOnOverlay = false;
 	bool _isCapturedOnOverlay = false;
 
-	// _LogCaptureBlocked 的限流状态
-	std::chrono::steady_clock::time_point _lastBlockLogTime{};
-	size_t _lastBlockLogReasonHash = 0;
+	// _LogCaptureBlocked 的限流状态。按原因分别限流：让行、跳过裁剪区等不同原因会
+	// 交替出现，共用一个时间戳会互相顶掉，导致每帧都记录
+	static constexpr size_t BLOCK_LOG_SLOT_COUNT = 8;
+	std::array<size_t, BLOCK_LOG_SLOT_COUNT> _blockLogReasonHashes{};
+	std::array<std::chrono::steady_clock::time_point, BLOCK_LOG_SLOT_COUNT> _blockLogTimes{};
 
-	// 诊断日志：_UpdateCursorState 的调用计数与心跳。渲染循环一旦暂停（例如切换前台窗口、
-	// 画面收起到后台），这个方法就不再被调用，只能靠心跳的时间间隔发现
+	// 诊断日志：_UpdateCursorState 的调用计数。渲染循环一旦暂停（例如切换前台窗口、
+	// 画面收起到后台），这个方法就不再被调用，用调用间隔可以发现这种中断
 	uint64_t _updateCount = 0;
 	std::chrono::steady_clock::time_point _lastUpdateTime{};
+	// 系统光标真实可见性的核对周期
 	std::chrono::steady_clock::time_point _lastHeartbeatTime{};
-	// 状态变更日志用：上一次记录时的关键状态
+	// 详细诊断日志（MAGPIE_LOG_LEVEL=debug）用：上一次记录时的关键状态
 	bool _hasLoggedState = false;
 	bool _loggedUnderCapture = false;
 	bool _loggedShouldDrawCursor = false;
@@ -145,10 +159,20 @@ private:
 	int16_t _loggedHitTest = HTNOWHERE;
 	// 上一次观察到的系统光标真实可见性
 	bool _loggedActualCursorVisible = false;
+	// 是否已记录过「源窗口自己持有光标捕获，本窗口继续尝试捕获」
+	bool _loggedSrcCaptureFallthrough = false;
+	// 是否已记录过「前台窗口开始捕获光标」
+	bool _loggedForegroundCaptureStart = false;
+	// 回归哨兵：「绘制光标但未捕获」的起始时刻与是否已报警
+	std::chrono::steady_clock::time_point _lostCaptureSince{};
+	bool _loggedCursorLost = false;
 
 	// 本实例是否正在贡献「隐藏系统光标」的期望。系统光标的可见性是进程全局的，
 	// 由 CursorManager.cpp 中的 g_hideSystemCursorCount 统一维护
 	bool _isHidingSystemCursor = false;
+
+	// 登记在多窗口列表中的缩放窗口句柄（析构时用，避免此时再去问 ScalingWindow）
+	HWND _hwndRegistered = NULL;
 
 	static inline const HCURSOR _hDiagonalSize1Cursor = LoadCursor(NULL, IDC_SIZENWSE);
 	static inline const HCURSOR _hDiagonalSize2Cursor = LoadCursor(NULL, IDC_SIZENESW);

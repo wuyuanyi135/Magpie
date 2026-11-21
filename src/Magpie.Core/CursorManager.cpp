@@ -43,6 +43,163 @@ static std::mutex g_clipCursorMutex;
 static const void* g_clipCursorOwner = nullptr;
 static HWND g_clipCursorOwnerHwnd = NULL;
 
+// 光标捕获的进程级归属。每个缩放窗口都有独立的 CursorManager，各自决定「是否捕获」
+// 并把光标搬到自己的映射位置。两个覆盖同一屏幕区域的缩放窗口同时捕获时，会把同一个
+// 系统光标在各自的映射点之间来回搬（实测 20~40ms 一轮），表现为光标瞬移、移动不跟随、
+// 游戏收不到鼠标。因此同一时刻只允许一个实例处于捕获状态，其余实例必须让行。
+//
+// 为什么仅靠归属仲裁就够了：遮挡判定依赖 WindowFromPoint，而正在捕获的缩放窗口会被
+// 设为 WS_EX_TRANSPARENT（点击穿透），会被 WindowFromPoint 跳过，导致它下面的缩放
+// 窗口误判「我的画面没被遮挡」。这个错误判定只可能发生在对方正处于捕获状态时——
+// 也就是恰好是持有者身上——让行规则正好拦住它。
+static std::mutex g_captureOwnerMutex;
+static const CursorManager* g_captureOwner = nullptr;
+static HWND g_captureOwnerHwnd = NULL;
+// 换手节流：正常换手（用户切到另一个缩放窗口）必须立刻生效，所以不能用固定冷却时间；
+// 只对「来回抢」设上限——500ms 内最多换手 4 次，超过就让行，避免两个窗口在边界处
+// 高频抖动把光标搬来搬去
+static std::array<std::chrono::steady_clock::time_point, 4> g_captureSwitchTimes{};
+static size_t g_captureSwitchIndex = 0;
+static constexpr auto CAPTURE_SWITCH_WINDOW = std::chrono::milliseconds(500);
+
+// 查询当前捕获持有者，用于诊断日志
+static std::pair<HWND, bool> QueryCaptureOwner(const CursorManager* self) noexcept {
+	std::lock_guard<std::mutex> lock(g_captureOwnerMutex);
+	return { g_captureOwnerHwnd, g_captureOwner == self };
+}
+
+static bool IsCaptureOwner(const CursorManager* self) noexcept {
+	std::lock_guard<std::mutex> lock(g_captureOwnerMutex);
+	return g_captureOwner == self;
+}
+
+static bool IsCaptureHeldByOther(const CursorManager* self) noexcept {
+	std::lock_guard<std::mutex> lock(g_captureOwnerMutex);
+	return g_captureOwner && g_captureOwner != self;
+}
+
+// 尝试登记为光标捕获持有者。失败时通过 blockReason 给出让行原因（供诊断日志使用）。
+// 注意 blockReason 只能指向静态字符串，调用方持有的是 string_view。
+static bool TryAcquireCapture(
+	const CursorManager* self,
+	HWND hwndScaling,
+	std::string_view* blockReason
+) noexcept {
+	std::lock_guard<std::mutex> lock(g_captureOwnerMutex);
+
+	if (g_captureOwner == self) {
+		return true;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+
+	if (g_captureOwner) {
+		if (g_captureOwnerHwnd && IsWindow(g_captureOwnerHwnd)) {
+			if (blockReason) {
+				*blockReason = "另一个缩放窗口持有光标捕获";
+			}
+			return false;
+		}
+
+		// 持有者的窗口已经销毁（例如对应的缩放已结束），回收后继续
+		Logger::Get().Info(fmt::format("光标捕获持有者 0x{:X} 的窗口已销毁，回收",
+			(uintptr_t)g_captureOwnerHwnd));
+		g_captureOwner = nullptr;
+		g_captureOwnerHwnd = NULL;
+	}
+
+	size_t recentSwitches = 0;
+	for (const std::chrono::steady_clock::time_point& t : g_captureSwitchTimes) {
+		if (t != std::chrono::steady_clock::time_point{} && now - t < CAPTURE_SWITCH_WINDOW) {
+			++recentSwitches;
+		}
+	}
+
+	if (recentSwitches >= g_captureSwitchTimes.size()) {
+		if (blockReason) {
+			*blockReason = "光标捕获换手过于频繁";
+		}
+		return false;
+	}
+
+	if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+		Logger::Get().Debug(fmt::format("光标捕获持有者切换: 0x{:X} -> 0x{:X}（{} ms 内第 {} 次）",
+			(uintptr_t)g_captureOwnerHwnd, (uintptr_t)hwndScaling,
+			CAPTURE_SWITCH_WINDOW.count(), recentSwitches + 1));
+	}
+
+	g_captureSwitchTimes[g_captureSwitchIndex] = now;
+	g_captureSwitchIndex = (g_captureSwitchIndex + 1) % g_captureSwitchTimes.size();
+
+	g_captureOwner = self;
+	g_captureOwnerHwnd = hwndScaling;
+	return true;
+}
+
+static void ReleaseCapture(const CursorManager* self) noexcept {
+	std::lock_guard<std::mutex> lock(g_captureOwnerMutex);
+
+	if (g_captureOwner != self) {
+		return;
+	}
+
+	if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+		Logger::Get().Debug(fmt::format("光标捕获持有者释放: 0x{:X}",
+			(uintptr_t)g_captureOwnerHwnd));
+	}
+
+	g_captureOwner = nullptr;
+	g_captureOwnerHwnd = NULL;
+}
+
+// 存活的所有缩放窗口。多窗口间的让行与点击穿透判定需要知道「还有谁覆盖着同一块屏幕」。
+// 不能用 WindowFromPoint 判断：正在捕获的缩放窗口是 WS_EX_TRANSPARENT，会被它跳过。
+static std::mutex g_scalingWindowsMutex;
+static std::vector<HWND> g_scalingWindows;
+
+static void RegisterScalingWindow(HWND hwnd) noexcept {
+	std::lock_guard<std::mutex> lock(g_scalingWindowsMutex);
+	if (std::find(g_scalingWindows.begin(), g_scalingWindows.end(), hwnd) == g_scalingWindows.end()) {
+		g_scalingWindows.push_back(hwnd);
+	}
+}
+
+static void UnregisterScalingWindow(HWND hwnd) noexcept {
+	std::lock_guard<std::mutex> lock(g_scalingWindowsMutex);
+	std::erase_if(g_scalingWindows, [hwnd](HWND h) { return h == hwnd; });
+}
+
+// 光标处是否覆盖着另一个更靠前的缩放窗口。Magpie 的焦点逻辑会把「源窗口在前台」的
+// 缩放窗口设为置顶，因此置顶与否就是多窗口之间的前后关系：非置顶的实例应当让行。
+static bool ShouldYieldToSibling(HWND hwndMine, POINT screenPt) noexcept {
+	if (!hwndMine) {
+		return false;
+	}
+
+	// 两个都置顶（或多显示器上互不重叠）时按先到先得，不由置顶状态决定
+	if ((DWORD)GetWindowExStyle(hwndMine) & WS_EX_TOPMOST) {
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(g_scalingWindowsMutex);
+	for (HWND h : g_scalingWindows) {
+		if (h == hwndMine || !IsWindow(h) || !IsWindowVisible(h)) {
+			continue;
+		}
+
+		if (!((DWORD)GetWindowExStyle(h) & WS_EX_TOPMOST)) {
+			continue;
+		}
+
+		RECT rect;
+		if (GetWindowRect(h, &rect) && Win32Helper::PtInRect(rect, screenPt)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static std::string _FormatClipRect(const RECT& rect) noexcept {
 	return fmt::format("({},{})-({},{})", rect.left, rect.top, rect.right, rect.bottom);
 }
@@ -174,6 +331,14 @@ CursorManager::~CursorManager() noexcept {
 			_RestoreClipCursor();
 		}
 	}
+
+	// 兜底：即使状态不一致也不要让持有者身份泄漏到下一个实例
+	ReleaseCapture(this);
+
+	if (_hwndRegistered) {
+		UnregisterScalingWindow(_hwndRegistered);
+		_hwndRegistered = NULL;
+	}
 }
 
 void CursorManager::Update() noexcept {
@@ -243,7 +408,9 @@ void CursorManager::IsCursorOnOverlay(bool value) noexcept {
 	}
 	_isOnOverlay = value;
 
-	Logger::Get().Info(fmt::format("叠加层光标状态: 光标{}叠加层上", value ? "位于" : "离开"));
+	if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+		Logger::Get().Debug(fmt::format("叠加层光标状态: 光标{}叠加层上", value ? "位于" : "离开"));
+	}
 
 	_UpdateCursorState();
 	_UpdateCursorPos();
@@ -255,8 +422,9 @@ void CursorManager::IsCursorCapturedOnOverlay(bool value) noexcept {
 	}
 	_isCapturedOnOverlay = value;
 
-	Logger::Get().Info(fmt::format("叠加层光标状态: {}捕获光标",
-		value ? "开始" : "结束"));
+	if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+		Logger::Get().Debug(fmt::format("叠加层光标状态: {}捕获光标", value ? "开始" : "结束"));
+	}
 
 	_UpdateCursorState();
 	_UpdateCursorPos();
@@ -274,6 +442,10 @@ void CursorManager::OnPark() noexcept {
 		_RestoreCursorSpeed();
 		_isUnderCapture = false;
 	}
+
+	// 收起期间不会再有 Update，必须在这里交出捕获归属，否则另一个缩放窗口会一直
+	// 读到「有人持有」而让行（持有者只有在 Update 里才会被释放）
+	ReleaseCapture(this);
 
 	_isCapturedOnForeground = false;
 	_shouldDrawCursor = false;
@@ -632,6 +804,38 @@ static bool PtInWindow(HWND hWnd, POINT pt) noexcept {
 }
 
 // 检测光标位于哪个窗口上，是否检测缩放窗口由 clickThroughHost 指定
+// 某个屏幕点上真正会接收鼠标的窗口，跳过本进程的所有缩放窗口。缩放窗口是盖在源窗口
+// 上的叠加层，捕获期间点击穿透、未捕获时又会自己接收鼠标，两者都不是「遮挡源窗口的
+// 窗口」，判断点击会落到谁身上时必须把它们排除掉
+static HWND WindowBelowScalingWindows(POINT pt) noexcept {
+	struct EnumData {
+		POINT pt;
+		std::vector<HWND> scalingWindows;
+		HWND result;
+	} data{ pt, {}, NULL };
+	{
+		std::lock_guard<std::mutex> lock(g_scalingWindowsMutex);
+		data.scalingWindows = g_scalingWindows;
+	}
+
+	EnumWindows([](HWND hWnd, LPARAM lParam) {
+		EnumData& data = *(EnumData*)lParam;
+		if (std::find(data.scalingWindows.begin(), data.scalingWindows.end(), hWnd) !=
+			data.scalingWindows.end()) {
+			return TRUE;
+		}
+
+		if (PtInWindow(hWnd, data.pt)) {
+			data.result = hWnd;
+			return FALSE;
+		} else {
+			return TRUE;
+		}
+	}, (LPARAM)&data);
+
+	return data.result;
+}
+
 static HWND WindowFromPoint(HWND hwndScaling, const RECT& rendererRect, POINT pt, bool clickThroughHost) noexcept {
 	struct EnumData {
 		HWND result;
@@ -667,6 +871,15 @@ static bool IsEdgeArea(int16_t area) noexcept {
 	return area >= HTSIZEFIRST && area <= HTSIZELAST;
 }
 
+// 是否需要「源窗口是否被别的窗口遮挡」这一判定。只有桌面复制抓的是屏幕上的那一块
+// 区域，画面里会出现盖在源窗口上的窗口，鼠标应当交给它们。窗口级捕获（WGC / DWM 共享
+// 表面 / GDI）的画面只包含源窗口自身——此时按源坐标判定遮挡，会把用户根本看不见的
+// 窗口（另一个游戏客户端、后面的浏览器）当成遮挡：缩放窗口既不进入捕获、又被设为
+// 不透明，鼠标输入无处可去，形成死区，只有切出切回才恢复
+static bool NeedsSourceOcclusionCheck(const ScalingOptions& options) noexcept {
+	return options.captureMethod == CaptureMethod::DesktopDuplication;
+}
+
 void CursorManager::_LogStateSnapshot(std::string_view tag) noexcept {
 	ScalingWindow& scalingWindow = ScalingWindow::Get();
 	const ScalingOptions& options = scalingWindow.Options();
@@ -700,12 +913,15 @@ void CursorManager::_LogStateSnapshot(std::string_view tag) noexcept {
 		hwndAtSrcCursor = WindowFromPoint(hwndScaling, rendererRect, srcCursorPos, true);
 	}
 
+	// 多窗口时的捕获归属：不是持有者却想捕获的实例就是被让行规则拦下的那个
+	const auto [captureOwnerHwnd, isCaptureOwner] = QueryCaptureOwner(this);
+
 	Logger::Get().Info(fmt::format(
 		"[光标诊断:{}] 更新#{} 捕获={} 绘制={} 前台捕获={} 叠加层={}/{}(捕获/光标) "
 		"hitTest={}(已完成位置=({},{}))"
 		" | 光标=({},{}) 源坐标=({},{})"
 		" | 源窗口=0x{:X}(前台={} 移动={}) 前台窗口=0x{:X} 前台捕获窗口=0x{:X} 前台GUI标志=0x{:X}"
-		" | 缩放窗口=0x{:X}(置顶={} 透明={} 可见={} 最小化={})"
+		" | 缩放窗口=0x{:X}(置顶={} 透明={} 可见={} 最小化={}) 捕获持有者=0x{:X}(本实例={})"
 		" | 源矩形=({},{})-({},{}) 目标矩形=({},{})-({},{}) 渲染矩形=({},{})-({},{})"
 		" | 光标处窗口(缩放坐标)=0x{:X} 光标处窗口(源坐标)=0x{:X}"
 		" | 实际系统光标: 可见={} 句柄=0x{:X} (查询{})"
@@ -721,6 +937,7 @@ void CursorManager::_LogStateSnapshot(std::string_view tag) noexcept {
 		(exStyle & WS_EX_TRANSPARENT) != 0,
 		hwndScaling && IsWindowVisible(hwndScaling) != FALSE,
 		hwndScaling && IsIconic(hwndScaling) != FALSE,
+		(uintptr_t)captureOwnerHwnd, isCaptureOwner,
 		srcRect.left, srcRect.top, srcRect.right, srcRect.bottom,
 		destRect.left, destRect.top, destRect.right, destRect.bottom,
 		rendererRect.left, rendererRect.top, rendererRect.right, rendererRect.bottom,
@@ -732,27 +949,41 @@ void CursorManager::_LogStateSnapshot(std::string_view tag) noexcept {
 }
 
 void CursorManager::_LogCaptureBlocked(std::string_view reason, HWND hwndCur) noexcept {
-	// 相同原因限流：原因变化立即记录，否则每 3 秒记录一次
+	// 相同原因 3 秒内只记一次。按原因分槽限流：让行、跳过裁剪区等不同原因会交替
+	// 出现，否则会互相顶掉限流状态，变成每帧一条
 	size_t reasonHash = 1469598103934665603ull;
 	for (char c : reason) {
 		reasonHash ^= (size_t)(uint8_t)c;
 		reasonHash *= 1099511628211ull;
 	}
+	reasonHash |= 1;	// 0 表示该槽未使用
 
 	const auto now = std::chrono::steady_clock::now();
-	if (reasonHash == _lastBlockLogReasonHash &&
-		now - _lastBlockLogTime < std::chrono::seconds(3)) {
+	const size_t slot = reasonHash % BLOCK_LOG_SLOT_COUNT;
+
+	if (_blockLogReasonHashes[slot] == reasonHash &&
+		now - _blockLogTimes[slot] < std::chrono::seconds(3)) {
 		return;
 	}
-	_lastBlockLogReasonHash = reasonHash;
-	_lastBlockLogTime = now;
+	_blockLogReasonHashes[slot] = reasonHash;
+	_blockLogTimes[slot] = now;
 
-	_LogStateSnapshot(fmt::format("未能进入光标捕获: {}{}", reason,
-		hwndCur ? fmt::format("（光标处窗口 0x{:X}）", (uintptr_t)hwndCur) : std::string()));
+	const auto [ownerHwnd, isOwner] = QueryCaptureOwner(this);
+	_LogStateSnapshot(fmt::format("未能进入光标捕获: {}{}；捕获持有者=0x{:X}（本实例={}）",
+		reason,
+		hwndCur ? fmt::format("（光标处窗口 0x{:X}）", (uintptr_t)hwndCur) : std::string(),
+		(uintptr_t)ownerHwnd, isOwner));
 }
 
 void CursorManager::_UpdateCursorState() noexcept {
 	++_updateCount;
+
+	// 首次更新时登记本窗口，供多窗口间的让行与点击穿透判定使用
+	const HWND hwndOwn = ScalingWindow::Get().Handle();
+	if (hwndOwn && hwndOwn != _hwndRegistered) {
+		_hwndRegistered = hwndOwn;
+		RegisterScalingWindow(hwndOwn);
+	}
 
 	// 渲染循环一旦暂停，本方法就不再被调用，光标会冻结在最后一帧的状态上。这里用调用
 	// 间隔把「更新中断」本身记录下来，否则日志里只会出现一段无法解释的空白
@@ -800,7 +1031,15 @@ void CursorManager::_UpdateCursorState() noexcept {
 		if (!_isUnderCapture) {
 			POINT cursorPos;
 			GetCursorPos(&cursorPos);
-			_StartCapture(cursorPos, "3D 游戏模式");
+
+			std::string_view acquireBlock;
+			if (!_StartCapture(cursorPos, "3D 游戏模式", &acquireBlock)) {
+				// 另一个缩放窗口持有光标捕获：让行，既不隐藏系统光标也不改点击穿透
+				_shouldDrawCursor = false;
+				_LogCaptureBlocked(acquireBlock, NULL);
+				return;
+			}
+
 			_ReliableSetCursorPos(cursorPos);
 
 			_shouldDrawCursor = true;
@@ -844,12 +1083,14 @@ void CursorManager::_UpdateCursorState() noexcept {
 			// 记录鼠标输入的归属。未处于捕获状态时缩放窗口必须是透明的，否则它会吞掉
 			// 本该送到捕获窗口的鼠标消息，表现为「游戏收不到鼠标」，同时光标被 Magpie
 			// 绘制并冻结在最后一帧的位置——正是「光标不跟随、切出切回才恢复」的症状
-			if (!_loggedCapturedOnForeground) {
-				_loggedCapturedOnForeground = true;
-				Logger::Get().Info(fmt::format(
-					"前台窗口开始捕获光标: hwndCapture=0x{:X}（源窗口=0x{:X}，缩放窗口=0x{:X}），GUI 标志=0x{:X}",
-					(uintptr_t)info.hwndCapture, (uintptr_t)hwndSrc,
-					(uintptr_t)ScalingWindow::Get().Handle(), (uintptr_t)info.flags));
+			if (!_loggedForegroundCaptureStart) {
+				_loggedForegroundCaptureStart = true;
+				if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+					Logger::Get().Debug(fmt::format(
+						"前台窗口开始捕获光标: hwndCapture=0x{:X}（源窗口=0x{:X}，缩放窗口=0x{:X}），GUI 标志=0x{:X}",
+						(uintptr_t)info.hwndCapture, (uintptr_t)hwndSrc,
+						(uintptr_t)ScalingWindow::Get().Handle(), (uintptr_t)info.flags));
+				}
 			} else if (!_isUnderCapture) {
 				_LogCaptureBlocked("前台窗口捕获着光标，本窗口未处于捕获状态，本帧跳过光标状态机", NULL);
 			}
@@ -874,15 +1115,38 @@ void CursorManager::_UpdateCursorState() noexcept {
 				_RestoreClipCursor();
 			}
 
-			// 当光标被前台窗口捕获时我们除了限制光标外什么也不做，即光标
-			// 可以在缩放窗口上自由移动。
-			return;
+			// 源窗口自己长期持有光标捕获（很多游戏在鼠标锁定 / mouse-look 时 SetCapture
+			// 之后不释放）时不能像拖拽那样直接跳过：真实光标还留在缩放窗口上，源窗口收到
+			// 的坐标全部落在客户区之外，表现为「游戏内光标不响应」，只有切出切回（捕获被
+			// 解除）才能恢复。这种情况继续走下面的正常流程，由 _StartCapture 把光标搬进
+			// 源窗口
+			const bool captureOwnedBySrc = info.hwndCapture == hwndSrc ||
+				(IsChild(hwndSrc, info.hwndCapture) &&
+					(GetWindowStyle(info.hwndCapture) & WS_CHILD));
+			const bool fallThrough = captureOwnedBySrc && !_isUnderCapture &&
+				!_isOnOverlay && !(info.flags & GUI_INMOVESIZE);
+
+			if (fallThrough) {
+				if (!_loggedSrcCaptureFallthrough) {
+					_loggedSrcCaptureFallthrough = true;
+					Logger::Get().Info(fmt::format(
+						"源窗口持有光标捕获（hwndCapture=0x{:X}），本窗口未捕获，继续正常流程尝试进入捕获",
+						(uintptr_t)info.hwndCapture));
+				}
+			} else {
+				// 当光标被前台窗口捕获时我们除了限制光标外什么也不做，即光标
+				// 可以在缩放窗口上自由移动。
+				return;
+			}
 		}
 
-		if (_loggedCapturedOnForeground) {
-			_loggedCapturedOnForeground = false;
-			Logger::Get().Info("前台窗口已释放光标");
+		if (_loggedForegroundCaptureStart) {
+			_loggedForegroundCaptureStart = false;
+			if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+				Logger::Get().Debug("前台窗口已释放光标");
+			}
 		}
+		_loggedSrcCaptureFallthrough = false;
 
 		// 处理只是点击了标题栏而没有拖动的情况
 		if (info.hwndCapture != hwndSrc) {
@@ -905,8 +1169,10 @@ void CursorManager::_UpdateCursorState() noexcept {
 
 		SetWindowLong(hwndScaling, GWL_EXSTYLE,
 			value ? (cur | WS_EX_TRANSPARENT) : (cur & ~WS_EX_TRANSPARENT));
-		Logger::Get().Info(fmt::format("缩放窗口点击穿透: {}",
-			value ? "开启（鼠标消息送往源窗口）" : "关闭（缩放窗口自己接收鼠标）"));
+		if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+			Logger::Get().Debug(fmt::format("缩放窗口点击穿透: {}",
+				value ? "开启（鼠标消息送往源窗口）" : "关闭（缩放窗口自己接收鼠标）"));
+		}
 	};
 
 	POINT cursorPos;
@@ -939,18 +1205,24 @@ void CursorManager::_UpdateCursorState() noexcept {
 		///////////////////////////////////////////////////////////
 
 		HWND hwndCur = WindowFromPoint(hwndScaling, rendererRect, SrcToScaling(cursorPos, isSrcFocused), false);
-		_shouldDrawCursor = hwndCur == hwndScaling;
+		// 光标处覆盖着另一个更靠前的缩放窗口时，光标归它管理，本实例让行
+		const bool yieldToSibling =
+			hwndCur == hwndScaling && ShouldYieldToSibling(hwndScaling, cursorPos);
+		_shouldDrawCursor = hwndCur == hwndScaling && !yieldToSibling;
 
 		if (_shouldDrawCursor) {
 			// 缩放窗口未被遮挡
 			bool stopCapture = _isOnOverlay;
 
 			if (!stopCapture) {
-				// 检查源窗口是否被遮挡
-				hwndCur = WindowFromPoint(hwndScaling, rendererRect, cursorPos, true);
+				// 检查源窗口是否被遮挡。窗口级捕获的画面里不会出现盖在源窗口上的窗口，
+				// 这种判定会误伤（见 NeedsSourceOcclusionCheck 的注释）
+				if (NeedsSourceOcclusionCheck(options)) {
+					hwndCur = WindowFromPoint(hwndScaling, rendererRect, cursorPos, true);
 
-				stopCapture = hwndCur != hwndSrc &&
-					(!IsChild(hwndSrc, hwndCur) || !(GetWindowStyle(hwndCur) & WS_CHILD));
+					stopCapture = hwndCur != hwndSrc &&
+						(!IsChild(hwndSrc, hwndCur) || !(GetWindowStyle(hwndCur) & WS_CHILD));
+				}
 
 				if (!stopCapture) {
 					shouldClearHitTestResult = false;
@@ -989,7 +1261,9 @@ void CursorManager::_UpdateCursorState() noexcept {
 			// 缩放窗口被遮挡
 			setClickThrough(false);
 
-			if (!_StopCapture(cursorPos, false, "缩放窗口被遮挡")) {
+			if (!_StopCapture(cursorPos, false,
+				yieldToSibling ? "另一个缩放窗口在前台（置顶）" : "缩放窗口被遮挡"))
+			{
 				_shouldDrawCursor = true;
 				_LogCaptureBlocked("缩放窗口被遮挡且无法退出捕获（目标位置不在任何屏幕上）", NULL);
 			}
@@ -1009,7 +1283,10 @@ void CursorManager::_UpdateCursorState() noexcept {
 		/////////////////////////////////////////////////////////
 
 		HWND hwndCur = WindowFromPoint(hwndScaling, rendererRect, cursorPos, false);
-		_shouldDrawCursor = hwndCur == hwndScaling;
+		// 光标处覆盖着另一个更靠前的缩放窗口时，光标归它管理，本实例让行
+		const bool yieldToSibling =
+			hwndCur == hwndScaling && ShouldYieldToSibling(hwndScaling, cursorPos);
+		_shouldDrawCursor = hwndCur == hwndScaling && !yieldToSibling;
 
 		if (_shouldDrawCursor) {
 			// 缩放窗口未被遮挡
@@ -1022,15 +1299,18 @@ void CursorManager::_UpdateCursorState() noexcept {
 				}
 
 				if (startCapture) {
-					// 检查源窗口是否被遮挡
-					hwndCur = WindowFromPoint(hwndScaling, rendererRect, newCursorPos, true);
+					// 检查源窗口是否被遮挡。窗口级捕获的画面里不会出现盖在源窗口上的
+					// 窗口，这种判定会误伤（见 NeedsSourceOcclusionCheck 的注释）
+					if (NeedsSourceOcclusionCheck(options)) {
+						hwndCur = WindowFromPoint(hwndScaling, rendererRect, newCursorPos, true);
 
-					startCapture = hwndCur == hwndSrc ||
-						(IsChild(hwndSrc, hwndCur) && (GetWindowStyle(hwndCur) & WS_CHILD));
+						startCapture = hwndCur == hwndSrc ||
+							(IsChild(hwndSrc, hwndCur) && (GetWindowStyle(hwndCur) & WS_CHILD));
 
-					if (!startCapture) {
-						blockReason = "源窗口在光标处被遮挡";
-						blockHwnd = hwndCur;
+						if (!startCapture) {
+							blockReason = "源窗口在光标处被遮挡";
+							blockHwnd = hwndCur;
+						}
 					}
 
 					if (startCapture) {
@@ -1054,7 +1334,10 @@ void CursorManager::_UpdateCursorState() noexcept {
 				if (startCapture) {
 					setClickThrough(true);
 
-					_StartCapture(cursorPos, "光标位于画面内且源窗口未被遮挡");
+					if (!_StartCapture(cursorPos, "光标位于画面内且源窗口未被遮挡", &blockReason)) {
+						// 让行：本实例不绘制光标，隐藏系统光标与绘制交给持有者
+						_shouldDrawCursor = false;
+					}
 				} else {
 					setClickThrough(false);
 				}
@@ -1089,7 +1372,9 @@ void CursorManager::_UpdateCursorState() noexcept {
 					if (WindowFromPoint(hwndScaling, rendererRect, clampedPos, false) == hwndScaling) {
 						setClickThrough(true);
 
-						_StartCapture(cursorPos, "光标从黑边外移入画面");
+						if (!_StartCapture(cursorPos, "光标从黑边外移入画面", &blockReason)) {
+							_shouldDrawCursor = false;
+						}
 					} else {
 						// 要跳跃的位置被遮挡
 						setClickThrough(false);
@@ -1103,7 +1388,9 @@ void CursorManager::_UpdateCursorState() noexcept {
 					if (Win32Helper::PtInRect(destRect, cursorPos)) {
 						setClickThrough(true);
 
-						_StartCapture(cursorPos, "源窗口不在前台，光标进入输出区域");
+						if (!_StartCapture(cursorPos, "源窗口不在前台，光标进入输出区域", &blockReason)) {
+							_shouldDrawCursor = false;
+						}
 					} else {
 						setClickThrough(false);
 
@@ -1113,11 +1400,36 @@ void CursorManager::_UpdateCursorState() noexcept {
 					blockReason = "光标在黑边内，且位于叠加层上";
 				}
 			}
+		} else if (yieldToSibling) {
+			blockReason = "另一个缩放窗口在前台（置顶），本实例让行";
 		}
 	}
 
 	if (shouldClearHitTestResult) {
 		_ClearHitTestResult();
+	}
+
+	// 多窗口保底：本实例不持有光标，而光标处覆盖着另一个置顶的缩放窗口时，必须保持
+	// 点击穿透。持有者的缩放窗口是透明的，鼠标消息会穿透它落到本窗口上，本窗口若参与
+	// 命中测试就会把输入吃掉——这正是「鼠标失焦、游戏收不到鼠标」的直接原因。
+	//
+	// 反过来，不再让行且没有别的实例持有光标时必须恢复不透明，否则本窗口永远无法被
+	// 命中，也就再也无法重新捕获光标（透明是自锁的：WindowFromPoint 会跳过自己）。
+	if (hwndScaling) {
+		POINT realCursorPos;
+		if (GetCursorPos(&realCursorPos)) {
+			const bool yield = !_isUnderCapture && !_isOnOverlay &&
+				ShouldYieldToSibling(hwndScaling, realCursorPos);
+
+			if (yield) {
+				setClickThrough(true);
+			} else if (!_isUnderCapture && !_isOnOverlay &&
+				!IsCaptureHeldByOther(this) &&
+				Win32Helper::PtInRect(rendererRect, realCursorPos))
+			{
+				setClickThrough(false);
+			}
+		}
 	}
 
 	// 光标位于缩放窗口上却没有进入捕获：此时系统光标被隐藏、由 Magpie 绘制光标，但源窗口
@@ -1126,10 +1438,29 @@ void CursorManager::_UpdateCursorState() noexcept {
 		_LogCaptureBlocked(blockReason, blockHwnd);
 	}
 
-	// 状态变更与心跳：状态机静默时也能从日志还原当时的完整状态，并据此判断渲染循环是否
-	// 仍在运行（心跳间隔异常说明 Update 没有被调用）
+	// 真实系统光标的可见性可能被其他程序或 OS 改变，而我们只缓存了期望值，因此每 5 秒
+	// 核对一次，只在变化时记录
 	{
-		const auto heartbeatNow = std::chrono::steady_clock::now();
+		const auto now2 = std::chrono::steady_clock::now();
+		if (now2 - _lastHeartbeatTime >= std::chrono::seconds(5)) {
+			_lastHeartbeatTime = now2;
+
+			CURSORINFO ci{ .cbSize = sizeof(ci) };
+			if (GetCursorInfo(&ci)) {
+				const bool visible = (ci.flags & CURSOR_SHOWING) != 0;
+				if (visible != _loggedActualCursorVisible) {
+					_loggedActualCursorVisible = visible;
+					Logger::Get().Info(fmt::format(
+						"实际系统光标可见性变化: {}（Magpie 期望隐藏={}）",
+						visible ? "显示" : "隐藏", _isHidingSystemCursor));
+				}
+			}
+		}
+	}
+
+	// 状态一变就记录完整快照。正常运行时不需要，只在排查难以复现的输入问题时打开
+	// （MAGPIE_LOG_LEVEL=debug）
+	if (Logger::Get().IsEnabled(spdlog::level::debug)) {
 		const DWORD curStyle = (DWORD)GetWindowExStyle(hwndScaling);
 		const bool transparent = (curStyle & WS_EX_TRANSPARENT) != 0;
 		const bool topmost = (curStyle & WS_EX_TOPMOST) != 0;
@@ -1156,27 +1487,8 @@ void CursorManager::_UpdateCursorState() noexcept {
 			_loggedTransparent = transparent;
 			_loggedTopmost = topmost;
 			_loggedHitTest = _lastCompletedHitTestResult;
-			_lastHeartbeatTime = heartbeatNow;
 
 			_LogStateSnapshot("状态变更");
-		} else if (heartbeatNow - _lastHeartbeatTime >= std::chrono::seconds(5)) {
-			_lastHeartbeatTime = heartbeatNow;
-
-			// 系统光标的真实可见性可能被其他程序或 OS 改变，而我们只缓存了期望值
-			CURSORINFO ci{ .cbSize = sizeof(ci) };
-			if (GetCursorInfo(&ci)) {
-				const bool visible = (ci.flags & CURSOR_SHOWING) != 0;
-				if (visible != _loggedActualCursorVisible) {
-					_loggedActualCursorVisible = visible;
-					Logger::Get().Info(fmt::format(
-						"实际系统光标可见性变化: {}（Magpie 期望隐藏={}）",
-						visible ? "显示" : "隐藏", _isHidingSystemCursor));
-				}
-			}
-
-			_LogStateSnapshot(_shouldDrawCursor && !_isUnderCapture
-				? "心跳（Magpie 绘制光标但未捕获，请检查点击穿透与遮挡）"
-				: "心跳");
 		}
 	}
 
@@ -1188,11 +1500,42 @@ void CursorManager::_UpdateCursorState() noexcept {
 
 	// SetCursorPos 应在 ClipCursor 之后，否则会受到上一次 ClipCursor 的影响
 	if (cursorPos != originCursorPos) {
-		_ReliableSetCursorPos(cursorPos);
+		// 另一个缩放窗口已接管光标：此刻只有它的映射有效，本实例再搬一次会把它踩掉，
+		// 两个窗口就会开始互相抢光标
+		if (IsCaptureHeldByOther(this)) {
+			_LogCaptureBlocked("跳过光标移动：另一个缩放窗口持有光标捕获", NULL);
+		} else {
+			_ReliableSetCursorPos(cursorPos);
+		}
 	}
 
 	// 光标位置可能改变，需要更新
 	_UpdateCursorPos();
+
+	// 回归哨兵：光标由 Magpie 绘制、源窗口在前台，却没有处于捕获状态，意味着源窗口收不到
+	// 鼠标输入——点击穿透、遮挡判定、多窗口让行等所有已知缺陷最终都表现为这个状态。
+	// 持续 1 秒仍未恢复就报警一次，这样以后的改动若悄悄退化，日志里会直接留下证据，
+	// 而不是等到用户复现时才发现「什么都没有记录」
+	const bool cursorLost = _shouldDrawCursor && !_isUnderCapture &&
+		!_isOnOverlay && !_isCapturedOnOverlay && ScalingWindow::Get().SrcTracker().IsFocused();
+	if (cursorLost) {
+		const auto canaryNow = std::chrono::steady_clock::now();
+		if (_lostCaptureSince == std::chrono::steady_clock::time_point{}) {
+			_lostCaptureSince = canaryNow;
+		} else if (!_loggedCursorLost && canaryNow - _lostCaptureSince >= std::chrono::seconds(1)) {
+			_loggedCursorLost = true;
+			Logger::Get().Warn(fmt::format(
+				"光标已由 Magpie 绘制但未进入捕获超过 1 秒，源窗口收不到鼠标输入"
+				"（光标=({},{})，源窗口=0x{:X}，缩放窗口=0x{:X}，点击穿透={}）",
+				_cursorPos.x, _cursorPos.y,
+				(uintptr_t)ScalingWindow::Get().SrcTracker().Handle(),
+				(uintptr_t)ScalingWindow::Get().Handle(),
+				((DWORD)GetWindowExStyle(ScalingWindow::Get().Handle()) & WS_EX_TRANSPARENT) != 0));
+		}
+	} else {
+		_lostCaptureSince = {};
+		_loggedCursorLost = false;
+	}
 }
 
 static BOOL CALLBACK EnumMonitorProc(HMONITOR, HDC, LPRECT monitorRect, LPARAM data) {
@@ -1505,9 +1848,19 @@ void CursorManager::_UpdateCursorPos() noexcept {
 	}
 }
 
-void CursorManager::_StartCapture(POINT& cursorPos, std::string_view reason) noexcept {
+bool CursorManager::_StartCapture(
+	POINT& cursorPos,
+	std::string_view reason,
+	std::string_view* blockReason
+) noexcept {
 	if (_isUnderCapture) {
-		return;
+		return true;
+	}
+
+	// 多窗口：同一时刻只允许一个缩放窗口捕获光标。另一个覆盖同一区域的缩放窗口若也
+	// 进入捕获，会把光标搬到它自己的映射位置，两边来回搬就形成 20~40ms 的抖动
+	if (!TryAcquireCapture(this, ScalingWindow::Get().Handle(), blockReason)) {
+		return false;
 	}
 
 	const Renderer& renderer = ScalingWindow::Get().Renderer();
@@ -1536,11 +1889,58 @@ void CursorManager::_StartCapture(POINT& cursorPos, std::string_view reason) noe
 		cursorPos.x, cursorPos.y));
 
 	_isUnderCapture = true;
+
+	// 捕获期间缩放窗口是点击穿透的，鼠标消息会落到该屏幕点最上面的窗口。如果有别的窗口
+	// 盖在源窗口之上（多客户端时很常见，例如另一个游戏窗口正好压在源窗口左上角），点击
+	// 就会激活那个窗口——表现为「某一小块区域仿佛变成了另一个客户端」。
+	// 源窗口就是当前画面显示的内容，把它抬到最前，保证输入落到它身上。
+	_EnsureSourceNotCovered(cursorPos);
+
+	return true;
+}
+
+void CursorManager::_EnsureSourceNotCovered(POINT srcPos) noexcept {
+	ScalingWindow& scalingWindow = ScalingWindow::Get();
+	const HWND hwndSrc = scalingWindow.SrcTracker().Handle();
+	if (!hwndSrc) {
+		return;
+	}
+
+	// 只看真正接收鼠标的窗口：别的缩放窗口正盖在这里也不算遮挡源窗口
+	const HWND hwndAbove = WindowBelowScalingWindows(srcPos);
+	if (!hwndAbove || hwndAbove == hwndSrc || IsChild(hwndSrc, hwndAbove)) {
+		return;
+	}
+
+	// 覆盖源窗口的正是用户当前在用的窗口时不抢层级，否则会把它强行压在游戏下面
+	if (hwndAbove == GetForegroundWindow()) {
+		_LogCaptureBlocked("源窗口被当前前台窗口覆盖，未调整层级", hwndAbove);
+		return;
+	}
+
+	if (!SetWindowPos(hwndSrc, HWND_TOP, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)) {
+		Logger::Get().Win32Error(fmt::format(
+			"抬升源窗口 0x{:X} 失败（被 0x{:X} 覆盖）", (uintptr_t)hwndSrc, (uintptr_t)hwndAbove));
+		return;
+	}
+
+	// 正常情况下抬升后就不再被覆盖，只有用户又激活了别的窗口才会重复出现，因此不必限流
+	Logger::Get().Info(fmt::format(
+		"源窗口 0x{:X} 被 0x{:X} 覆盖，已将其置于最前，避免点击落到别的窗口",
+		(uintptr_t)hwndSrc, (uintptr_t)hwndAbove));
 }
 
 bool CursorManager::_StopCapture(POINT& cursorPos, bool onDestroy, std::string_view reason) noexcept {
 	if (!_isUnderCapture) {
 		return true;
+	}
+
+	// 处于捕获状态时本实例理应是持有者。不一致说明登记被其他路径清掉过，记录下来
+	// 便于排查，同时仍按正常流程退出，避免状态卡死
+	const bool wasOwner = IsCaptureOwner(this);
+	if (!wasOwner) {
+		Logger::Get().Warn("退出光标捕获时发现本实例并非持有者（捕获状态与登记不一致）");
 	}
 
 	// 在以下情况下离开捕获状态:
@@ -1557,9 +1957,15 @@ bool CursorManager::_StopCapture(POINT& cursorPos, bool onDestroy, std::string_v
 	POINT newCursorPos = SrcToScaling(cursorPos, ScalingWindow::Get().SrcTracker().IsFocused());
 
 	if (onDestroy || MonitorFromPoint(newCursorPos, MONITOR_DEFAULTTONULL)) {
-		cursorPos = newCursorPos;
+		// 只有持有者才把光标搬回缩放坐标：另一个实例可能已经接管并用它自己的映射
+		// 写过光标位置，此时再搬一次会把它踩掉（多窗口抖动的一半来自这里）
+		if (wasOwner) {
+			cursorPos = newCursorPos;
+		}
+
 		_RestoreCursorSpeed();
 		_isUnderCapture = false;
+		ReleaseCapture(this);
 
 		const std::string_view reasonText = reason.empty() ? std::string_view("未指定原因") : reason;
 		Logger::Get().Info(fmt::format("退出光标捕获（{}），光标移到 ({},{})，onDestroy={}",
@@ -1579,6 +1985,14 @@ bool CursorManager::_StopCapture(POINT& cursorPos, bool onDestroy, std::string_v
 
 void CursorManager::_SetClipCursor(const RECT& clipRect, bool is3DGameMode) noexcept {
 	if (ScalingWindow::Get().Options().IsDebugMode()) {
+		return;
+	}
+
+	// 多窗口：裁剪区是桌面级全局状态，也只应由光标捕获的持有者控制。否则两个实例会
+	// 交替写入自己的裁剪区域，把光标在两点之间夹来夹去（持有者的 1×1 临时裁剪区
+	// 也会被另一个实例覆盖，导致「光标移到源窗口内」这一步失效）
+	if (IsCaptureHeldByOther(this)) {
+		_LogCaptureBlocked("跳过光标裁剪区设置：另一个缩放窗口持有光标捕获", NULL);
 		return;
 	}
 
@@ -1611,10 +2025,12 @@ void CursorManager::_SetClipCursor(const RECT& clipRect, bool is3DGameMode) noex
 
 	const HWND hwndScaling = ScalingWindow::Get().Handle();
 	if (g_clipCursorOwner != this) {
-		Logger::Get().Info(fmt::format(
-			"光标裁剪区持有者切换: 0x{:X} -> 0x{:X}，区域 {}",
-			(uintptr_t)g_clipCursorOwnerHwnd, (uintptr_t)hwndScaling, _FormatClipRect(clipRect)
-		));
+		if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+			Logger::Get().Debug(fmt::format(
+				"光标裁剪区持有者切换: 0x{:X} -> 0x{:X}，区域 {}",
+				(uintptr_t)g_clipCursorOwnerHwnd, (uintptr_t)hwndScaling, _FormatClipRect(clipRect)
+			));
+		}
 	}
 
 	g_clipCursorOwner = this;

@@ -57,6 +57,16 @@ public:
 
 	void SetLevel(spdlog::level::level_enum logLevel) noexcept;
 
+	// 详细诊断日志（每帧状态快照、层级变更细节等）用来排查难以复现的问题，默认级别
+	// 下应当关闭。格式化参数是即时求值的，因此调用方先用 IsEnabled 判断再构造消息。
+	bool IsEnabled(spdlog::level::level_enum logLevel) const noexcept {
+		return _logger && _logger->should_log(logLevel);
+	}
+
+	void Debug(std::string_view msg, const SourceLocation& location = SourceLocation::Current()) noexcept {
+		_Log(spdlog::level::debug, msg, location);
+	}
+
 	void Flush() noexcept {
 		if (_logger) {
 			_logger->flush();

@@ -11,6 +11,23 @@
 
 namespace Magpie {
 
+// 切换窗口或激活被前台锁阻塞时，shell 会把前台临时交给 ForegroundStaging 窗口（实测
+// 每次可持续 0.4~1.2 秒）。把它当成「源窗口失去前台」会让缩放窗口降级置顶、丢掉光标
+// 捕获，这期间点击会漏到下面的窗口上——正是低频的「光标不跟随 + 点击切到别的游戏窗口」
+static bool IsTransientForegroundWindow(HWND hwnd) noexcept {
+	if (!hwnd) {
+		return true;
+	}
+
+	wchar_t className[64];
+	if (!GetClassName(hwnd, className, (int)std::size(className))) {
+		return false;
+	}
+
+	return wcscmp(className, L"ForegroundStaging") == 0 ||
+		wcscmp(className, L"Windows.UI.Input.InputSite.WindowClass") == 0;
+}
+
 static bool IsWindowMoving(HWND hWnd) noexcept {
 	GUITHREADINFO guiThreadInfo{ .cbSize = sizeof(GUITHREADINFO) };
 	if (GetGUIThreadInfo(GetWindowThreadProcessId(hWnd, nullptr), &guiThreadInfo)) {
@@ -196,7 +213,8 @@ bool SrcTracker::UpdateState(
 		}
 	}
 
-	if (_isFocused != (hwndFore == _hWnd)) {
+	// 临时前台窗口（shell 的 ForegroundStaging 等）不代表焦点真的变了，保持原状态
+	if (!IsTransientForegroundWindow(hwndFore) && _isFocused != (hwndFore == _hWnd)) {
 		_isFocused = !_isFocused;
 		focusedChanged = true;
 	}

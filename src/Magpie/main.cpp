@@ -31,10 +31,25 @@ static void SetWorkingDir() noexcept {
 }
 
 static void InitializeLogger(const wchar_t* logFilePath) noexcept {
+	// 默认 info。设置环境变量 MAGPIE_LOG_LEVEL=debug 可打开每帧状态快照这类详细诊断
+	// 日志（排查难以复现的输入/光标问题时使用）
+	spdlog::level::level_enum level = spdlog::level::info;
+	{
+		wchar_t buf[16];
+		if (GetEnvironmentVariable(L"MAGPIE_LOG_LEVEL", buf, (DWORD)std::size(buf)) > 0) {
+			const std::wstring_view value(buf);
+			if (_wcsicmp(value.data(), L"debug") == 0) {
+				level = spdlog::level::debug;
+			} else if (_wcsicmp(value.data(), L"trace") == 0) {
+				level = spdlog::level::trace;
+			}
+		}
+	}
+
 	// 最多四个日志文件（magpie.log 加三个归档），每个最多 500KB。诊断光标/输入问题时
 	// 需要保留足够长的历史，一次复现可能发生在很久之前
 	Logger::Get().Initialize(
-		spdlog::level::info,
+		level,
 		logFilePath,
 		CommonSharedConstants::MAX_LOG_SIZE,
 		3

@@ -11,11 +11,9 @@ bool Logger::Initialize(spdlog::level::level_enum logLevel, std::wstring logFile
 		_logger->set_level(logLevel);
 		_logger->set_pattern("%Y-%m-%d %H:%M:%S.%e|%l|%s:%#|%!|%v");
 		_logger->flush_on(spdlog::level::warn);
-#ifdef _DEBUG
-		spdlog::flush_every(5s);
-#else
-		spdlog::flush_every(30s);
-#endif
+		// 崩溃或异常退出时缓冲区里的日志会整体丢失，而诊断光标这类问题恰恰需要"最后一刻"
+		// 的记录，因此把刷新间隔压到 1 秒（写日志本身有锁，代价可以接受）
+		spdlog::flush_every(1s);
 	} catch (const spdlog::spdlog_ex&) {
 		return false;
 	}

@@ -299,13 +299,10 @@ private:
 	// 收起前源窗口的位置（屏幕坐标），恢复时移回
 	RECT _srcRectBeforePark{};
 
-	// 诊断日志：渲染循环的心跳。光标状态机的更新挂在渲染循环上，循环停摆时光标会冻结，
+	// 诊断日志：渲染循环计数。光标状态机的更新挂在渲染循环上，循环停摆时光标会冻结，
 	// 因此必须能看出「哪一段没有渲染」
 	uint64_t _renderLoopCount = 0;
 	std::chrono::steady_clock::time_point _lastRenderLoopTime{};
-	std::chrono::steady_clock::time_point _lastRenderHeartbeatTime{};
-	bool _loggedSrcParked = false;
-	bool _loggedSrcFocused = false;
 };
 
 }

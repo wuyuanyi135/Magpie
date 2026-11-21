@@ -551,8 +551,8 @@ void ScalingWindow::_UnparkSrcWindow() noexcept {
 }
 
 void ScalingWindow::Render() noexcept {
-	// 渲染循环心跳：光标状态机每帧在 _cursorManager->Update() 中更新，循环一旦停摆光标会
-	// 冻结在最后一帧。记录调用间隔，日志里出现空白时才能区分「没有事件」和「没有渲染」
+	// 光标状态机每帧在 _cursorManager->Update() 中更新，渲染循环一旦停摆光标就会冻结在
+	// 最后一帧。记录调用间隔，日志里出现空白时才能区分「没有事件」和「没有渲染」
 	const auto renderNow = std::chrono::steady_clock::now();
 	++_renderLoopCount;
 	if (_lastRenderLoopTime != std::chrono::steady_clock::time_point{}) {
@@ -564,12 +564,6 @@ void ScalingWindow::Render() noexcept {
 		}
 	}
 	_lastRenderLoopTime = renderNow;
-
-	const bool renderHeartbeat =
-		renderNow - _lastRenderHeartbeatTime >= std::chrono::seconds(10);
-	if (renderHeartbeat) {
-		_lastRenderHeartbeatTime = renderNow;
-	}
 
 	bool isSrcRepositioning = false;
 	bool srcFocusedChanged = false;
@@ -586,11 +580,6 @@ void ScalingWindow::Render() noexcept {
 		// 时自动恢复画面，其余时间跳过渲染以节省资源。源窗口被最小化则走上方
 		// 的等待-重启路径
 		if (!_srcTracker.IsFocused()) {
-			if (renderHeartbeat) {
-				Logger::Get().Info(fmt::format(
-					"渲染心跳: 第 {} 次渲染调用，画面已收起到后台且源窗口不在前台，跳过渲染与光标更新",
-					_renderLoopCount));
-			}
 			return;
 		}
 
@@ -599,13 +588,6 @@ void ScalingWindow::Render() noexcept {
 		Logger::Get().Info(fmt::format("源窗口焦点变为{}，更新缩放窗口层级",
 			_srcTracker.IsFocused() ? "前台" : "后台"));
 		_UpdateFocusStateAsync();
-	}
-
-	if (renderHeartbeat) {
-		Logger::Get().Info(fmt::format(
-			"渲染心跳: 第 {} 次渲染调用，源窗口在前台={}，收起={}，渲染器={}，缩放窗口可见={}，可调整大小/移动={}",
-			_renderLoopCount, _srcTracker.IsFocused(), _isSrcParked, _renderer != nullptr,
-			IsWindowVisible(Handle()) != FALSE, _isResizingOrMoving));
 	}
 
 	// 虽然可以在第一帧渲染完成后再隐藏系统光标，但某些设备上显示窗口时光标状态会变成忙，
@@ -2095,10 +2077,12 @@ void ScalingWindow::_UpdateFrameMargins() const noexcept {
 winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 	// 切换前台窗口后缩放窗口的层级的最终结果决定光标能否被捕获：如果缩放窗口被源窗口
 	// 盖住，WindowFromPoint 会命中源窗口，光标状态机会判定「缩放窗口被遮挡」
-	Logger::Get().Info(fmt::format(
-		"焦点更新开始: 源窗口在前台={}，缩放窗口置顶={}，前台窗口=0x{:X}",
-		_srcTracker.IsFocused(), IsTopmostWindow(Handle()) != FALSE,
-		(uintptr_t)GetForegroundWindow()));
+	if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+		Logger::Get().Debug(fmt::format(
+			"焦点更新开始: 源窗口在前台={}，缩放窗口置顶={}，前台窗口=0x{:X}",
+			_srcTracker.IsFocused(), IsTopmostWindow(Handle()) != FALSE,
+			(uintptr_t)GetForegroundWindow()));
+	}
 
 	if (_options.IsWindowedMode()) {
 		// 根据源窗口状态绘制非客户区，我们必须自己控制非客户区是绘制成焦点状态还是非焦点
@@ -2122,8 +2106,9 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 
 		const bool oldTopmost = IsTopmostWindow(Handle());
 		const bool newTopmost = _CalcTopmostState();
-		Logger::Get().Info(fmt::format("焦点更新: 置顶状态 {} -> {}",
-			oldTopmost, newTopmost));
+		if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+			Logger::Get().Debug(fmt::format("焦点更新: 置顶状态 {} -> {}", oldTopmost, newTopmost));
+		}
 		if (oldTopmost != newTopmost) {
 			if (newTopmost) {
 				for (int i = 0; i < 10; ++i) {
@@ -2146,7 +2131,9 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 				HWND hwndFore = GetForegroundWindow();
 				if (!hwndFore) {
 					// 切换窗口时有一个瞬间无前台窗口，这里等待切换完成
-					Logger::Get().Info("焦点更新: 当前无前台窗口（正在切换），等待 1ms 后重试");
+					if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+						Logger::Get().Debug("焦点更新: 当前无前台窗口（正在切换），等待 1ms 后重试");
+					}
 					co_await winrt::resume_after(1ms);
 					isInBackground = true;
 					hwndFore = GetForegroundWindow();
@@ -2157,10 +2144,12 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 					DWORD windowIL;
 					isForeMovable = Win32Helper::GetWindowIntegrityLevel(hwndFore, windowIL) &&
 						windowIL <= Win32Helper::GetCurrentProcessIntegrityLevel();
-					Logger::Get().Info(fmt::format(
-						"焦点更新: 前台窗口=0x{:X}，完整性级别可移动={}（前台上移方式={}）",
-						(uintptr_t)hwndFore, isForeMovable,
-						isForeMovable ? "将缩放窗口置于源窗口之前" : "先置源窗口再恢复前台窗口"));
+					if (Logger::Get().IsEnabled(spdlog::level::debug)) {
+						Logger::Get().Debug(fmt::format(
+							"焦点更新: 前台窗口=0x{:X}，完整性级别可移动={}（前台上移方式={}）",
+							(uintptr_t)hwndFore, isForeMovable,
+							isForeMovable ? "将缩放窗口置于源窗口之前" : "先置源窗口再恢复前台窗口"));
+					}
 				}
 				
 				if (!isForeMovable) {
@@ -2225,11 +2214,21 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 		PostMessage(HWND_BROADCAST, WM_MAGPIE_SCALINGCHANGED, 0, 1);
 	}
 
-	Logger::Get().Info(fmt::format(
-		"焦点更新结束: 缩放窗口置顶={}，紧邻源窗口之前={}，源窗口在前台={}，源窗口被遮挡判定依赖这些层级",
-		IsTopmostWindow(Handle()) != FALSE,
-		GetWindow(_srcTracker.Handle(), GW_HWNDPREV) == Handle(),
-		_srcTracker.IsFocused()));
+	// 层级直接决定 WindowFromPoint 的判定：源窗口在前台时缩放窗口必须紧邻它之前，否则
+	// 缩放窗口会被判成「被遮挡」，光标随之退出捕获。异常时无论日志级别都记录下来
+	const bool topmost = IsTopmostWindow(Handle()) != FALSE;
+	const bool adjacentToSrc = GetWindow(_srcTracker.Handle(), GW_HWNDPREV) == Handle();
+	const bool focused = _srcTracker.IsFocused();
+	if ((focused && !adjacentToSrc) || Logger::Get().IsEnabled(spdlog::level::debug)) {
+		const std::string msg = fmt::format(
+			"焦点更新结束: 缩放窗口置顶={}，紧邻源窗口之前={}，源窗口在前台={}",
+			topmost, adjacentToSrc, focused);
+		if (focused && !adjacentToSrc) {
+			Logger::Get().Warn(msg);
+		} else {
+			Logger::Get().Debug(msg);
+		}
+	}
 }
 
 bool ScalingWindow::_CalcTopmostState() const noexcept {
