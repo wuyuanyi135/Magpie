@@ -31,12 +31,13 @@ static void SetWorkingDir() noexcept {
 }
 
 static void InitializeLogger(const wchar_t* logFilePath) noexcept {
-	// 最多两个日志文件，每个最多 500KB
+	// 最多四个日志文件（magpie.log 加三个归档），每个最多 500KB。诊断光标/输入问题时
+	// 需要保留足够长的历史，一次复现可能发生在很久之前
 	Logger::Get().Initialize(
 		spdlog::level::info,
 		logFilePath,
 		CommonSharedConstants::MAX_LOG_SIZE,
-		1
+		3
 	);
 }
 

@@ -24,6 +24,29 @@ static INT g_originCursorSpeed = 0;	// 0 表示当前没有任何实例处于捕
 // (实例, 调整后的速度)，按调整时间排序，用于在某个实例退出捕获时恢复其他实例的调整值
 static std::vector<std::pair<const void*, INT>> g_adjustedCursorSpeeds;
 
+// 系统光标的显示与隐藏（ShowSystemCursor）同样是全局的。多窗口并存时若各实例独立
+// 记忆可见性，一个实例改变全局状态后，仍处于捕获状态的其它实例会因「缓存与期望一致」
+// 跳过真正的调用，可见性和实际状态脱钩：典型表现是切换缩放窗口或停止其中一个缩放后，
+// 系统光标浮在仍在捕获的全屏窗口上。因此进程内共享「要求隐藏的实例数」和全局实际状态，
+// 只有全局状态真正变化时才调用。
+static std::mutex g_cursorVisibilityMutex;
+static int g_hideSystemCursorCount = 0;	// 要求隐藏系统光标的实例数
+static bool g_systemCursorHidden = false;	// 系统光标当前是否实际处于隐藏状态
+
+// 光标限制区域（ClipCursor）同样是桌面级的全局状态，而每个缩放窗口都有自己的
+// CursorManager。多窗口并存时，A 实例设置的裁剪区会被 B 实例覆盖，B 又可能把 A
+// 缓存里的矩形当成自己的来回写；再加上切换前台窗口时 OS 会自动清空裁剪区，快速
+// Alt+Tab 时很容易把光标困在源窗口那一小块里（表现为光标不跟随鼠标，再切一次
+// 前台窗口才恢复）。因此进程内用一把锁串行化所有 ClipCursor 读写，并记录当前
+// 裁剪区由哪个实例持有。
+static std::mutex g_clipCursorMutex;
+static const void* g_clipCursorOwner = nullptr;
+static HWND g_clipCursorOwnerHwnd = NULL;
+
+static std::string _FormatClipRect(const RECT& rect) noexcept {
+	return fmt::format("({},{})-({},{})", rect.left, rect.top, rect.right, rect.bottom);
+}
+
 // 进程在光标速度被调慢期间崩溃的话，系统光标速度会永远停留在调慢值。因此首次调整时
 // 把原始速度写入标记文件，所有实例退出时删除；下次启动若标记仍在，说明上次异常退出，
 // 据此还原（见 RestoreCursorSpeedIfCrashed）。
@@ -144,7 +167,7 @@ CursorManager::~CursorManager() noexcept {
 	if (_isUnderCapture) {
 		POINT cursorPos;
 		if (GetCursorPos(&cursorPos)) {
-			_StopCapture(cursorPos, true);
+			_StopCapture(cursorPos, true, "CursorManager 析构");
 			_ReliableSetCursorPos(cursorPos);
 		} else {
 			Logger::Get().Win32Error("GetCursorPos 失败");
@@ -219,7 +242,9 @@ void CursorManager::IsCursorOnOverlay(bool value) noexcept {
 		return;
 	}
 	_isOnOverlay = value;
-	
+
+	Logger::Get().Info(fmt::format("叠加层光标状态: 光标{}叠加层上", value ? "位于" : "离开"));
+
 	_UpdateCursorState();
 	_UpdateCursorPos();
 }
@@ -230,8 +255,32 @@ void CursorManager::IsCursorCapturedOnOverlay(bool value) noexcept {
 	}
 	_isCapturedOnOverlay = value;
 
+	Logger::Get().Info(fmt::format("叠加层光标状态: {}捕获光标",
+		value ? "开始" : "结束"));
+
 	_UpdateCursorState();
 	_UpdateCursorPos();
+}
+
+void CursorManager::OnPark() noexcept {
+	// 缩放画面收起到后台时缩放窗口将被隐藏，此后 _UpdateCursorState 不再执行，
+	// 因此这里必须无条件退出捕获状态并恢复系统光标
+	Logger::Get().Info(fmt::format(
+		"画面收起到后台，强制复位光标状态（捕获={}，绘制={}，前台捕获={}，叠加层={}/{}）",
+		_isUnderCapture, _shouldDrawCursor, _isCapturedOnForeground,
+		_isCapturedOnOverlay, _isOnOverlay));
+
+	if (_isUnderCapture) {
+		_RestoreCursorSpeed();
+		_isUnderCapture = false;
+	}
+
+	_isCapturedOnForeground = false;
+	_shouldDrawCursor = false;
+	_hCursor = NULL;
+
+	_ShowSystemCursor(true);
+	_RestoreClipCursor();
 }
 
 void CursorManager::_ShowSystemCursor(bool show, bool onDestory) {
@@ -239,16 +288,44 @@ void CursorManager::_ShowSystemCursor(bool show, bool onDestory) {
 		return;
 	}
 
-	if (_isSystemCursorShown == show) {
-		return;
+	const bool wantHide = !show;
+
+	// 更新本实例贡献的期望值并重算全局状态。关键在于只有全局状态真正变化时才继续：
+	// 即使本实例的期望未变，其它实例改变全局状态也不会被本实例以过期的缓存覆盖；
+	// 而某个实例退出捕获时，只要还有实例要求隐藏，全局状态就维持隐藏。
+	bool newHidden = false;
+	int hideCount = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_cursorVisibilityMutex);
+
+		if (_isHidingSystemCursor == wantHide) {
+			return;
+		}
+		_isHidingSystemCursor = wantHide;
+
+		g_hideSystemCursorCount += wantHide ? 1 : -1;
+		assert(g_hideSystemCursorCount >= 0);
+		hideCount = g_hideSystemCursorCount;
+
+		newHidden = g_hideSystemCursorCount > 0;
+		if (newHidden == g_systemCursorHidden) {
+			// 全局状态不受影响，如某个实例退出捕获而另一个实例仍处于捕获状态
+			return;
+		}
+
+		g_systemCursorHidden = newHidden;
 	}
+
+	const bool globalShow = !newHidden;
+
+	Logger::Get().Info(fmt::format("系统光标可见性切换: {}（要求隐藏的实例数 {}）",
+		newHidden ? "隐藏" : "显示", hideCount));
 
 	static const auto showSystemCursor =
 		Win32Helper::LoadFunction<void WINAPI(BOOL)>(L"user32.dll", "ShowSystemCursor");
 
 	if (showSystemCursor) {
-		showSystemCursor((BOOL)show);
-		_isSystemCursorShown = show;
+		showSystemCursor((BOOL)globalShow);
 	} else {
 		// 获取 ShowSystemCursor 失败则回落到 Magnification API
 		static bool initialized = []() {
@@ -261,12 +338,13 @@ void CursorManager::_ShowSystemCursor(bool show, bool onDestory) {
 		}();
 
 		if (initialized) {
-			MagShowSystemCursor(show);
-			_isSystemCursorShown = show;
+			MagShowSystemCursor(globalShow);
+		} else {
+			Logger::Get().Error("无法显示或隐藏系统光标");
 		}
 	}
 
-	ScalingWindow::Get().Renderer().OnCursorVisibilityChanged(show, onDestory);
+	ScalingWindow::Get().Renderer().OnCursorVisibilityChanged(globalShow, onDestory);
 }
 
 void CursorManager::_AdjustCursorSpeed() noexcept {
@@ -383,18 +461,51 @@ void CursorManager::_RestoreCursorSpeed() noexcept {
 // SetCursorPos 时队列中仍有旧事件尚未处理。
 // 
 // 这个函数使用 ClipCursor 将光标限制在目标位置一段时间，等待系统将输入队列处理完毕。
-void CursorManager::_ReliableSetCursorPos(POINT pos) const noexcept {
+void CursorManager::_ReliableSetCursorPos(POINT pos) noexcept {
+	RECT tempClipRect{ pos.x,pos.y,pos.x + 1,pos.y + 1 };
 	RECT originClipRect;
-	GetClipCursor(&originClipRect);
 
-	RECT newClipRect{ pos.x,pos.y,pos.x + 1,pos.y + 1 };
-	ClipCursor(&newClipRect);
+	{
+		std::lock_guard<std::mutex> lock(g_clipCursorMutex);
+		if (!GetClipCursor(&originClipRect)) {
+			Logger::Get().Win32Error("GetClipCursor 失败");
+			return;
+		}
+
+		ClipCursor(&tempClipRect);
+	}
 
 	// 等待一段时间，不能太短
 	Sleep(8);
 
-	// 还原原始光标限制区域
-	ClipCursor(&originClipRect);
+	{
+		std::lock_guard<std::mutex> lock(g_clipCursorMutex);
+
+		RECT curClip;
+		if (!GetClipCursor(&curClip)) {
+			Logger::Get().Win32Error("GetClipCursor 失败");
+		} else if (curClip == tempClipRect) {
+			// 还原原始光标限制区域
+			ClipCursor(&originClipRect);
+			if (g_clipCursorOwner == this) {
+				_lastRealClip = originClipRect;
+			}
+		} else {
+			// 这 8 毫秒里 OS（切换前台窗口会清空裁剪区）或其他缩放窗口改过裁剪区。
+			// 此时绝不能把 originClipRect 写回去，否则可能把光标困在源窗口里。
+			Logger::Get().Info(fmt::format(
+				"临时 1×1 裁剪区已被外部修改（{} -> {}），跳过还原",
+				_FormatClipRect(tempClipRect), _FormatClipRect(curClip)
+			));
+
+			if (g_clipCursorOwner == this) {
+				g_clipCursorOwner = nullptr;
+				g_clipCursorOwnerHwnd = NULL;
+				_lastClip = { std::numeric_limits<LONG>::max() };
+				_lastRealClip = { std::numeric_limits<LONG>::max() };
+			}
+		}
+	}
 
 	// 有的窗口（比如 Magpie 主窗口）捕获光标后光标形状有时不会主动更新，发送 WM_SETCURSOR
 	// 强制更新。
@@ -556,13 +667,116 @@ static bool IsEdgeArea(int16_t area) noexcept {
 	return area >= HTSIZEFIRST && area <= HTSIZELAST;
 }
 
+void CursorManager::_LogStateSnapshot(std::string_view tag) noexcept {
+	ScalingWindow& scalingWindow = ScalingWindow::Get();
+	const ScalingOptions& options = scalingWindow.Options();
+	const Renderer& renderer = scalingWindow.Renderer();
+	const HWND hwndSrc = scalingWindow.SrcTracker().Handle();
+	const HWND hwndScaling = scalingWindow.Handle();
+	const RECT& srcRect = renderer.SrcRect();
+	const RECT& destRect = renderer.DestRect();
+	const RECT rendererRect = scalingWindow.RendererRect();
+
+	POINT cursorPos{};
+	GetCursorPos(&cursorPos);
+	const POINT srcCursorPos = ScalingToSrc(cursorPos);
+
+	const HWND hwndFore = GetForegroundWindow();
+	const DWORD exStyle = hwndScaling ? (DWORD)GetWindowExStyle(hwndScaling) : 0;
+
+	GUITHREADINFO info{ .cbSize = sizeof(info) };
+	GetGUIThreadInfo(NULL, &info);
+
+	// 系统光标的真实可见性。我们缓存了 g_systemCursorHidden，但别的程序或 OS 可能改变
+	// 实际状态，只有 GetCursorInfo 能看到真相
+	CURSORINFO cursorInfo{ .cbSize = sizeof(cursorInfo) };
+	const BOOL gotCursorInfo = GetCursorInfo(&cursorInfo);
+
+	// 遮挡判定的直接依据：光标在缩放坐标和源坐标下分别命中了哪个窗口
+	HWND hwndAtScalingCursor = NULL;
+	HWND hwndAtSrcCursor = NULL;
+	if (hwndScaling) {
+		hwndAtScalingCursor = WindowFromPoint(hwndScaling, rendererRect, cursorPos, false);
+		hwndAtSrcCursor = WindowFromPoint(hwndScaling, rendererRect, srcCursorPos, true);
+	}
+
+	Logger::Get().Info(fmt::format(
+		"[光标诊断:{}] 更新#{} 捕获={} 绘制={} 前台捕获={} 叠加层={}/{}(捕获/光标) "
+		"hitTest={}(已完成位置=({},{}))"
+		" | 光标=({},{}) 源坐标=({},{})"
+		" | 源窗口=0x{:X}(前台={} 移动={}) 前台窗口=0x{:X} 前台捕获窗口=0x{:X} 前台GUI标志=0x{:X}"
+		" | 缩放窗口=0x{:X}(置顶={} 透明={} 可见={} 最小化={})"
+		" | 源矩形=({},{})-({},{}) 目标矩形=({},{})-({},{}) 渲染矩形=({},{})-({},{})"
+		" | 光标处窗口(缩放坐标)=0x{:X} 光标处窗口(源坐标)=0x{:X}"
+		" | 实际系统光标: 可见={} 句柄=0x{:X} (查询{})"
+		" | 3D={} 窗口模式={} 调试={}",
+		tag, _updateCount, _isUnderCapture, _shouldDrawCursor, _isCapturedOnForeground,
+		_isCapturedOnOverlay, _isOnOverlay, _lastCompletedHitTestResult,
+		_lastCompletedHitTestPos.x, _lastCompletedHitTestPos.y,
+		cursorPos.x, cursorPos.y, srcCursorPos.x, srcCursorPos.y,
+		(uintptr_t)hwndSrc, scalingWindow.SrcTracker().IsFocused(),
+		scalingWindow.SrcTracker().IsMoving(),
+		(uintptr_t)hwndFore, (uintptr_t)info.hwndCapture, (uintptr_t)info.flags,
+		(uintptr_t)hwndScaling, (exStyle & WS_EX_TOPMOST) != 0,
+		(exStyle & WS_EX_TRANSPARENT) != 0,
+		hwndScaling && IsWindowVisible(hwndScaling) != FALSE,
+		hwndScaling && IsIconic(hwndScaling) != FALSE,
+		srcRect.left, srcRect.top, srcRect.right, srcRect.bottom,
+		destRect.left, destRect.top, destRect.right, destRect.bottom,
+		rendererRect.left, rendererRect.top, rendererRect.right, rendererRect.bottom,
+		(uintptr_t)hwndAtScalingCursor, (uintptr_t)hwndAtSrcCursor,
+		gotCursorInfo && (cursorInfo.flags & CURSOR_SHOWING),
+		(uintptr_t)cursorInfo.hCursor, gotCursorInfo != FALSE,
+		options.Is3DGameMode(), options.IsWindowedMode(), options.IsDebugMode()
+	));
+}
+
+void CursorManager::_LogCaptureBlocked(std::string_view reason, HWND hwndCur) noexcept {
+	// 相同原因限流：原因变化立即记录，否则每 3 秒记录一次
+	size_t reasonHash = 1469598103934665603ull;
+	for (char c : reason) {
+		reasonHash ^= (size_t)(uint8_t)c;
+		reasonHash *= 1099511628211ull;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (reasonHash == _lastBlockLogReasonHash &&
+		now - _lastBlockLogTime < std::chrono::seconds(3)) {
+		return;
+	}
+	_lastBlockLogReasonHash = reasonHash;
+	_lastBlockLogTime = now;
+
+	_LogStateSnapshot(fmt::format("未能进入光标捕获: {}{}", reason,
+		hwndCur ? fmt::format("（光标处窗口 0x{:X}）", (uintptr_t)hwndCur) : std::string()));
+}
+
 void CursorManager::_UpdateCursorState() noexcept {
+	++_updateCount;
+
+	// 渲染循环一旦暂停，本方法就不再被调用，光标会冻结在最后一帧的状态上。这里用调用
+	// 间隔把「更新中断」本身记录下来，否则日志里只会出现一段无法解释的空白
+	const auto now = std::chrono::steady_clock::now();
+	if (_lastUpdateTime != std::chrono::steady_clock::time_point{}) {
+		const auto gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+			now - _lastUpdateTime).count();
+		if (gapMs >= 1000) {
+			Logger::Get().Info(fmt::format(
+				"光标状态更新中断 {} ms（期间渲染循环未调用 Update），第 {} 次更新恢复",
+				gapMs, _updateCount));
+		}
+	}
+	_lastUpdateTime = now;
+
 	if (ScalingWindow::Get().IsResizingOrMoving()) {
+		_LogCaptureBlocked("缩放窗口正在调整大小/移动", NULL);
 		_RestoreClipCursor();
 		return;
 	}
 
 	if (ScalingWindow::Get().SrcTracker().IsMoving()) {
+		_LogCaptureBlocked("源窗口正在移动", NULL);
+
 		if (_isUnderCapture) {
 			// 防止缩放后光标超出屏幕
 			_ClipCursorOnSrcMoving();
@@ -586,7 +800,7 @@ void CursorManager::_UpdateCursorState() noexcept {
 		if (!_isUnderCapture) {
 			POINT cursorPos;
 			GetCursorPos(&cursorPos);
-			_StartCapture(cursorPos);
+			_StartCapture(cursorPos, "3D 游戏模式");
 			_ReliableSetCursorPos(cursorPos);
 
 			_shouldDrawCursor = true;
@@ -604,6 +818,8 @@ void CursorManager::_UpdateCursorState() noexcept {
 	}
 
 	if (_isCapturedOnOverlay) {
+		_LogCaptureBlocked("叠加层正在捕获光标（拖动工具栏等），本帧跳过光标状态更新", NULL);
+
 		// 光标被叠加层捕获时将光标限制在输出区域内
 		_SetClipCursor(destRect);
 		return;
@@ -624,6 +840,19 @@ void CursorManager::_UpdateCursorState() noexcept {
 			!(info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE)))
 		{
 			_isCapturedOnForeground = true;
+
+			// 记录鼠标输入的归属。未处于捕获状态时缩放窗口必须是透明的，否则它会吞掉
+			// 本该送到捕获窗口的鼠标消息，表现为「游戏收不到鼠标」，同时光标被 Magpie
+			// 绘制并冻结在最后一帧的位置——正是「光标不跟随、切出切回才恢复」的症状
+			if (!_loggedCapturedOnForeground) {
+				_loggedCapturedOnForeground = true;
+				Logger::Get().Info(fmt::format(
+					"前台窗口开始捕获光标: hwndCapture=0x{:X}（源窗口=0x{:X}，缩放窗口=0x{:X}），GUI 标志=0x{:X}",
+					(uintptr_t)info.hwndCapture, (uintptr_t)hwndSrc,
+					(uintptr_t)ScalingWindow::Get().Handle(), (uintptr_t)info.flags));
+			} else if (!_isUnderCapture) {
+				_LogCaptureBlocked("前台窗口捕获着光标，本窗口未处于捕获状态，本帧跳过光标状态机", NULL);
+			}
 
 			// 拖拽源窗口时应确保光标位置稳定，为此我们需要确定初始光标位置。但为什么在这
 			// 里而不是 OnSrcStartMove 中？虽然很难注意到，但光标在标题栏上轻微移动时不会
@@ -650,6 +879,11 @@ void CursorManager::_UpdateCursorState() noexcept {
 			return;
 		}
 
+		if (_loggedCapturedOnForeground) {
+			_loggedCapturedOnForeground = false;
+			Logger::Get().Info("前台窗口已释放光标");
+		}
+
 		// 处理只是点击了标题栏而没有拖动的情况
 		if (info.hwndCapture != hwndSrc) {
 			_localCursorPosOnMoving.x = std::numeric_limits<LONG>::max();
@@ -661,15 +895,32 @@ void CursorManager::_UpdateCursorState() noexcept {
 	const RECT rendererRect = ScalingWindow::Get().RendererRect();
 	const bool isSrcFocused = ScalingWindow::Get().SrcTracker().IsFocused();
 	
-	const DWORD style = GetWindowExStyle(hwndScaling);
+	// 缩放窗口的点击穿透状态决定鼠标消息能否到达源窗口。未处于捕获状态却又不穿透时，
+	// 缩放窗口会吞掉本该送到源窗口的输入，因此每次切换都记录下来
+	auto setClickThrough = [hwndScaling](bool value) {
+		const DWORD cur = (DWORD)GetWindowExStyle(hwndScaling);
+		if (((cur & WS_EX_TRANSPARENT) != 0) == value) {
+			return;
+		}
+
+		SetWindowLong(hwndScaling, GWL_EXSTYLE,
+			value ? (cur | WS_EX_TRANSPARENT) : (cur & ~WS_EX_TRANSPARENT));
+		Logger::Get().Info(fmt::format("缩放窗口点击穿透: {}",
+			value ? "开启（鼠标消息送往源窗口）" : "关闭（缩放窗口自己接收鼠标）"));
+	};
 
 	POINT cursorPos;
 	if (!GetCursorPos(&cursorPos)) {
+		_LogCaptureBlocked("GetCursorPos 失败", NULL);
 		_RestoreClipCursor();
 		return;
 	}
 
 	bool shouldClearHitTestResult = true;
+
+	// 光标在缩放窗口上却没能进入捕获的原因，用于诊断日志（见函数末尾）
+	std::string_view blockReason;
+	HWND blockHwnd = NULL;
 
 	const POINT originCursorPos = cursorPos;
 
@@ -717,31 +968,30 @@ void CursorManager::_UpdateCursorState() noexcept {
 			}
 
 			if (stopCapture) {
-				if (style & WS_EX_TRANSPARENT) {
-					SetWindowLong(hwndScaling, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT);
-				}
+				setClickThrough(false);
 
 				// 源窗口被遮挡或者光标位于叠加层上，这时虽然停止捕获光标，但依然将光标隐藏
-				_StopCapture(cursorPos);
-			} else {
+				std::string_view stopReason;
 				if (_isOnOverlay) {
-					if (style & WS_EX_TRANSPARENT) {
-						SetWindowLong(hwndScaling, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT);
-					}
+					stopReason = "光标位于叠加层上";
+				} else if (IsEdgeArea(_lastCompletedHitTestResult)) {
+					stopReason = "命中测试结果为缩放边框";
 				} else {
-					if (!(style & WS_EX_TRANSPARENT)) {
-						SetWindowLong(hwndScaling, GWL_EXSTYLE, style | WS_EX_TRANSPARENT);
-					}
+					stopReason = "源窗口在光标处被遮挡";
 				}
+
+				_StopCapture(cursorPos, false, stopReason);
+			} else {
+				// 未处于叠加层时缩放窗口应穿透，否则会挡住源窗口的鼠标输入
+				setClickThrough(!_isOnOverlay);
 			}
 		} else {
 			// 缩放窗口被遮挡
-			if (style & WS_EX_TRANSPARENT) {
-				SetWindowLong(hwndScaling, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT);
-			}
+			setClickThrough(false);
 
-			if (!_StopCapture(cursorPos)) {
+			if (!_StopCapture(cursorPos, false, "缩放窗口被遮挡")) {
 				_shouldDrawCursor = true;
+				_LogCaptureBlocked("缩放窗口被遮挡且无法退出捕获（目标位置不在任何屏幕上）", NULL);
 			}
 		}
 	} else {
@@ -767,6 +1017,9 @@ void CursorManager::_UpdateCursorState() noexcept {
 
 			if (Win32Helper::PtInRect(srcRect, newCursorPos)) {
 				bool startCapture = !_isOnOverlay;
+				if (!startCapture) {
+					blockReason = "光标位于叠加层上";
+				}
 
 				if (startCapture) {
 					// 检查源窗口是否被遮挡
@@ -774,6 +1027,11 @@ void CursorManager::_UpdateCursorState() noexcept {
 
 					startCapture = hwndCur == hwndSrc ||
 						(IsChild(hwndSrc, hwndCur) && (GetWindowStyle(hwndCur) & WS_CHILD));
+
+					if (!startCapture) {
+						blockReason = "源窗口在光标处被遮挡";
+						blockHwnd = hwndCur;
+					}
 
 					if (startCapture) {
 						shouldClearHitTestResult = false;
@@ -786,20 +1044,19 @@ void CursorManager::_UpdateCursorState() noexcept {
 						// 窗口模式缩放时可调整大小的区域经常位于缩放窗口边缘，因此使用系统光标
 						if (!startCapture) {
 							_shouldDrawCursor = !options.IsWindowedMode();
+							if (_shouldDrawCursor) {
+								blockReason = "命中测试结果为缩放边框";
+							}
 						}
 					}
 				}
 
 				if (startCapture) {
-					if (!(style & WS_EX_TRANSPARENT)) {
-						SetWindowLong(hwndScaling, GWL_EXSTYLE, style | WS_EX_TRANSPARENT);
-					}
-					
-					_StartCapture(cursorPos);
+					setClickThrough(true);
+
+					_StartCapture(cursorPos, "光标位于画面内且源窗口未被遮挡");
 				} else {
-					if (style & WS_EX_TRANSPARENT) {
-						SetWindowLong(hwndScaling, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT);
-					}
+					setClickThrough(false);
 				}
 			} else if (isSrcFocused) {
 				// 跳过黑边
@@ -830,32 +1087,30 @@ void CursorManager::_UpdateCursorState() noexcept {
 					};
 
 					if (WindowFromPoint(hwndScaling, rendererRect, clampedPos, false) == hwndScaling) {
-						if (!(style & WS_EX_TRANSPARENT)) {
-							SetWindowLong(hwndScaling, GWL_EXSTYLE, style | WS_EX_TRANSPARENT);
-						}
+						setClickThrough(true);
 
-						_StartCapture(cursorPos);
+						_StartCapture(cursorPos, "光标从黑边外移入画面");
 					} else {
 						// 要跳跃的位置被遮挡
-						if (style & WS_EX_TRANSPARENT) {
-							SetWindowLong(hwndScaling, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT);
-						}
+						setClickThrough(false);
+
+						blockReason = "黑边外侧的目标位置被遮挡（源窗口在前台）";
 					}
 				}
 			} else {
 				// 源窗口不在前台则允许光标进入黑边
 				if (!_isOnOverlay) {
 					if (Win32Helper::PtInRect(destRect, cursorPos)) {
-						if (!(style & WS_EX_TRANSPARENT)) {
-							SetWindowLong(hwndScaling, GWL_EXSTYLE, style | WS_EX_TRANSPARENT);
-						}
+						setClickThrough(true);
 
-						_StartCapture(cursorPos);
+						_StartCapture(cursorPos, "源窗口不在前台，光标进入输出区域");
 					} else {
-						if (style & WS_EX_TRANSPARENT) {
-							SetWindowLong(hwndScaling, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT);
-						}
+						setClickThrough(false);
+
+						blockReason = "光标在黑边内，且源窗口不在前台";
 					}
+				} else {
+					blockReason = "光标在黑边内，且位于叠加层上";
 				}
 			}
 		}
@@ -863,6 +1118,66 @@ void CursorManager::_UpdateCursorState() noexcept {
 
 	if (shouldClearHitTestResult) {
 		_ClearHitTestResult();
+	}
+
+	// 光标位于缩放窗口上却没有进入捕获：此时系统光标被隐藏、由 Magpie 绘制光标，但源窗口
+	// 收不到鼠标输入，表现为「光标不跟随 / 游戏光标没反应」。记录一次状态快照便于定位。
+	if (!blockReason.empty() && !_isUnderCapture) {
+		_LogCaptureBlocked(blockReason, blockHwnd);
+	}
+
+	// 状态变更与心跳：状态机静默时也能从日志还原当时的完整状态，并据此判断渲染循环是否
+	// 仍在运行（心跳间隔异常说明 Update 没有被调用）
+	{
+		const auto heartbeatNow = std::chrono::steady_clock::now();
+		const DWORD curStyle = (DWORD)GetWindowExStyle(hwndScaling);
+		const bool transparent = (curStyle & WS_EX_TRANSPARENT) != 0;
+		const bool topmost = (curStyle & WS_EX_TOPMOST) != 0;
+
+		bool stateChanged = !_hasLoggedState;
+		if (!stateChanged) {
+			stateChanged = _isUnderCapture != _loggedUnderCapture ||
+				_shouldDrawCursor != _loggedShouldDrawCursor ||
+				_isCapturedOnForeground != _loggedCapturedOnForeground ||
+				_isOnOverlay != _loggedOnOverlay ||
+				_isCapturedOnOverlay != _loggedCapturedOnOverlay ||
+				transparent != _loggedTransparent ||
+				topmost != _loggedTopmost ||
+				_lastCompletedHitTestResult != _loggedHitTest;
+		}
+
+		if (stateChanged) {
+			_hasLoggedState = true;
+			_loggedUnderCapture = _isUnderCapture;
+			_loggedShouldDrawCursor = _shouldDrawCursor;
+			_loggedCapturedOnForeground = _isCapturedOnForeground;
+			_loggedOnOverlay = _isOnOverlay;
+			_loggedCapturedOnOverlay = _isCapturedOnOverlay;
+			_loggedTransparent = transparent;
+			_loggedTopmost = topmost;
+			_loggedHitTest = _lastCompletedHitTestResult;
+			_lastHeartbeatTime = heartbeatNow;
+
+			_LogStateSnapshot("状态变更");
+		} else if (heartbeatNow - _lastHeartbeatTime >= std::chrono::seconds(5)) {
+			_lastHeartbeatTime = heartbeatNow;
+
+			// 系统光标的真实可见性可能被其他程序或 OS 改变，而我们只缓存了期望值
+			CURSORINFO ci{ .cbSize = sizeof(ci) };
+			if (GetCursorInfo(&ci)) {
+				const bool visible = (ci.flags & CURSOR_SHOWING) != 0;
+				if (visible != _loggedActualCursorVisible) {
+					_loggedActualCursorVisible = visible;
+					Logger::Get().Info(fmt::format(
+						"实际系统光标可见性变化: {}（Magpie 期望隐藏={}）",
+						visible ? "显示" : "隐藏", _isHidingSystemCursor));
+				}
+			}
+
+			_LogStateSnapshot(_shouldDrawCursor && !_isUnderCapture
+				? "心跳（Magpie 绘制光标但未捕获，请检查点击穿透与遮挡）"
+				: "心跳");
+		}
 	}
 
 	// 只要光标缩放后的位置在缩放窗口上，且该位置未被其他窗口遮挡，便可以隐藏光标。
@@ -1190,7 +1505,7 @@ void CursorManager::_UpdateCursorPos() noexcept {
 	}
 }
 
-void CursorManager::_StartCapture(POINT& cursorPos) noexcept {
+void CursorManager::_StartCapture(POINT& cursorPos, std::string_view reason) noexcept {
 	if (_isUnderCapture) {
 		return;
 	}
@@ -1216,10 +1531,14 @@ void CursorManager::_StartCapture(POINT& cursorPos) noexcept {
 		std::clamp(cursorPos.y, destRect.top, destRect.bottom - 1)
 	});
 
+	Logger::Get().Info(fmt::format("进入光标捕获（{}），光标移到源窗口内 ({},{})",
+		reason.empty() ? std::string_view("未指定原因") : reason,
+		cursorPos.x, cursorPos.y));
+
 	_isUnderCapture = true;
 }
 
-bool CursorManager::_StopCapture(POINT& cursorPos, bool onDestroy) noexcept {
+bool CursorManager::_StopCapture(POINT& cursorPos, bool onDestroy, std::string_view reason) noexcept {
 	if (!_isUnderCapture) {
 		return true;
 	}
@@ -1241,6 +1560,11 @@ bool CursorManager::_StopCapture(POINT& cursorPos, bool onDestroy) noexcept {
 		cursorPos = newCursorPos;
 		_RestoreCursorSpeed();
 		_isUnderCapture = false;
+
+		const std::string_view reasonText = reason.empty() ? std::string_view("未指定原因") : reason;
+		Logger::Get().Info(fmt::format("退出光标捕获（{}），光标移到 ({},{})，onDestroy={}",
+			reasonText, cursorPos.x, cursorPos.y, onDestroy));
+
 		return true;
 	} else {
 		// 目标位置不存在屏幕，则将光标限制在源窗口内
@@ -1265,19 +1589,38 @@ void CursorManager::_SetClipCursor(const RECT& clipRect, bool is3DGameMode) noex
 	// 一方面我们的场景很复杂，是否捕获光标、源窗口是否在前台、光标位置等都会影响限制
 	// 区域，和其他程序协同几乎不可能；另一方面切换窗口后 OS 会自动清空限制区域，很难
 	// 遇到需要协同的情况，不值得付出努力。
+	//
+	// 但多窗口下我们必须知道自己是否仍持有裁剪区：缓存与实际不一致时不能跳过设置。
+	std::lock_guard<std::mutex> lock(g_clipCursorMutex);
+
 	if (!is3DGameMode) {
 		RECT curClip;
-		GetClipCursor(&curClip);
+		if (!GetClipCursor(&curClip)) {
+			return;
+		}
 
-		if (curClip == _lastRealClip && clipRect == _lastClip) {
+		if (g_clipCursorOwner == this && curClip == _lastRealClip && clipRect == _lastClip) {
 			return;
 		}
 	}
 
-	if (ClipCursor(&clipRect)) {
-		_lastClip = clipRect;
-		GetClipCursor(&_lastRealClip);
+	if (!ClipCursor(&clipRect)) {
+		Logger::Get().Win32Warn("ClipCursor 失败");
+		return;
 	}
+
+	const HWND hwndScaling = ScalingWindow::Get().Handle();
+	if (g_clipCursorOwner != this) {
+		Logger::Get().Info(fmt::format(
+			"光标裁剪区持有者切换: 0x{:X} -> 0x{:X}，区域 {}",
+			(uintptr_t)g_clipCursorOwnerHwnd, (uintptr_t)hwndScaling, _FormatClipRect(clipRect)
+		));
+	}
+
+	g_clipCursorOwner = this;
+	g_clipCursorOwnerHwnd = hwndScaling;
+	_lastClip = clipRect;
+	GetClipCursor(&_lastRealClip);
 }
 
 void CursorManager::_RestoreClipCursor() noexcept {
@@ -1285,16 +1628,44 @@ void CursorManager::_RestoreClipCursor() noexcept {
 		return;
 	}
 
-	RECT curClip;
-	GetClipCursor(&curClip);
+	std::lock_guard<std::mutex> lock(g_clipCursorMutex);
 
-	// 如果其他程序更改了光标限制区域，我们就放弃更改
+	// 其他缩放窗口已接管裁剪区，本实例的缓存已经没有意义
+	if (g_clipCursorOwner != this) {
+		Logger::Get().Info(fmt::format(
+			"丢弃过期的光标裁剪区缓存 {}（当前持有者 0x{:X}）",
+			_FormatClipRect(_lastClip), (uintptr_t)g_clipCursorOwnerHwnd
+		));
+		_lastClip = { std::numeric_limits<LONG>::max() };
+		return;
+	}
+
+	RECT curClip;
+	if (!GetClipCursor(&curClip)) {
+		Logger::Get().Win32Error("GetClipCursor 失败");
+		return;
+	}
+
+	// 如果其他程序或 OS 更改了光标限制区域，就放弃更改。注意必须同时放弃持有者身份，
+	// 否则后续仍会按过期的缓存判断“不需要重新设置”。
 	if (curClip != _lastRealClip) {
+		Logger::Get().Info(fmt::format(
+			"光标裁剪区已被外部修改（缓存 {}，实际 {}），放弃还原",
+			_FormatClipRect(_lastRealClip), _FormatClipRect(curClip)
+		));
+
+		g_clipCursorOwner = nullptr;
+		g_clipCursorOwnerHwnd = NULL;
+		_lastClip = { std::numeric_limits<LONG>::max() };
 		return;
 	}
 
 	if (ClipCursor(nullptr)) {
+		g_clipCursorOwner = nullptr;
+		g_clipCursorOwnerHwnd = NULL;
 		_lastClip = { std::numeric_limits<LONG>::max() };
+	} else {
+		Logger::Get().Win32Warn("ClipCursor(nullptr) 失败");
 	}
 }
 
