@@ -59,6 +59,27 @@ static bool TrySetOwnder(HWND hwndToast, HWND hwndTarget) noexcept {
 	return SetWindowLongPtr(hwndToast, GWLP_HWNDPARENT, (LONG_PTR)hwndTarget) || GetLastError() == 0;
 }
 
+// 检索锚点窗口的框架矩形。目标窗口最小化或矩形不在任何屏幕上时（如缩放画面
+// 收起到后台后源窗口在屏幕外、主窗口被最小化）回退到主屏幕工作区，否则弹窗
+// 会出现在屏幕外
+static bool GetToastAnchorRect(HWND hwndTarget, RECT& rect) noexcept {
+	if (!IsWindow(hwndTarget) || !Win32Helper::GetWindowFrameRect(hwndTarget, rect)) {
+		return false;
+	}
+
+	if (IsIconic(hwndTarget) || !MonitorFromRect(&rect, MONITOR_DEFAULTTONULL)) {
+		const HMONITOR hMon = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
+		MONITORINFO mi{ sizeof(mi) };
+		if (!GetMonitorInfo(hMon, &mi)) {
+			return false;
+		}
+
+		rect = mi.rcWork;
+	}
+
+	return true;
+}
+
 static void UpdateToastPosition(HWND hwndToast, const RECT& frameRect, bool updateZOrder) noexcept {
 	// 根据窗口高度调整弹窗位置。
 	// 1. 如果高度小于 THRESHOLD1，弹窗位于中心；
@@ -114,7 +135,7 @@ fire_and_forget ToastPage::ShowMessageOnWindow(std::wstring title, std::wstring 
 	}
 
 	RECT frameRect;
-	if (!Win32Helper::GetWindowFrameRect(hwndTarget, frameRect)) {
+	if (!GetToastAnchorRect(hwndTarget, frameRect)) {
 		co_return;
 	}
 
@@ -249,8 +270,7 @@ fire_and_forget ToastPage::ShowMessageOnWindow(std::wstring title, std::wstring 
 			co_return;
 		}
 
-		if (!IsWindow((HWND)hwndTarget) || !IsWindow(_hwndToast) ||
-			!Win32Helper::GetWindowFrameRect((HWND)hwndTarget, frameRect))
+		if (!IsWindow(_hwndToast) || !GetToastAnchorRect((HWND)hwndTarget, frameRect))
 		{
 			// 附加的窗口关闭后 toast 也应关闭。应检查 curTeachingTip 是否已经在新的调用中被卸载，
 			// 见函数开头的 UnloadObject。

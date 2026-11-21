@@ -133,8 +133,12 @@ bool App::Initialize(const wchar_t* arguments) {
 	}
 
 	if (settings.IsAlwaysRunAsAdmin() && !Win32Helper::IsProcessElevated()) {
+		// Restart 内部已经 Quit 并释放了互斥量。此时除 AppSettings 外的服务都还没初始化
+		// （ScalingService 的 DispatcherQueueTimer 为 null，EffectsService 的初始化事件
+		// 永远不会被设置），调用 _Uninitialize 会在 ScalingService::Uninitialize 里
+		// 解引用空的 timer 而崩溃。因此这里只等待配置保存完成，然后退出。
 		Restart(true, arguments);
-		_Uninitialize();
+		AppSettings::Get().Uninitialize();
 		return false;
 	}
 

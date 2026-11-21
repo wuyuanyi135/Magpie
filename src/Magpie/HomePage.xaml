@@ -180,6 +180,17 @@
 						</local:ShortcutControl.Action>
 					</local:ShortcutControl>
 				</local:SettingsCard>
+				<local:SettingsCard x:Uid="Home_Toolbar_BackgroundRendering"
+				                    IsWrapEnabled="True">
+					<local:SettingsCard.HeaderIcon>
+						<FontIcon Glyph="&#xE768;" />
+					</local:SettingsCard.HeaderIcon>
+					<local:ShortcutControl x:Uid="Home_Toolbar_BackgroundRendering_ShortcutControl">
+						<local:ShortcutControl.Action>
+							<local:ShortcutAction>BackgroundRendering</local:ShortcutAction>
+						</local:ShortcutControl.Action>
+					</local:ShortcutControl>
+				</local:SettingsCard>
 				<local:SettingsCard x:Uid="Home_Toolbar_ScreenshotSaveDirectory"
 				                    Click="{x:Bind ViewModel.OpenScreenshotSaveDirectory}"
 				                    Description="{x:Bind ViewModel.ScreenshotSaveDirectory, Mode=OneWay}"
@@ -241,6 +252,38 @@
 					</local:SettingsCard.HeaderIcon>
 					<ToggleSwitch x:Uid="ToggleSwitch"
 					              IsOn="{x:Bind ViewModel.IsKeepScreenOn, Mode=TwoWay}" />
+				</local:SettingsCard>
+				<local:SettingsCard x:Uid="Home_Advanced_BackgroundRendering">
+					<local:SettingsCard.HeaderIcon>
+						<FontIcon Glyph="&#xE768;" />
+					</local:SettingsCard.HeaderIcon>
+					<ToggleSwitch x:Uid="ToggleSwitch"
+					              IsOn="{x:Bind ViewModel.IsBackgroundRendering, Mode=TwoWay}" />
+				</local:SettingsCard>
+				<local:SettingsCard x:Uid="Home_Advanced_MaxScalingWindows"
+				                    IsWrapEnabled="True">
+					<local:SettingsCard.HeaderIcon>
+						<FontIcon Glyph="&#xE8A9;" />
+					</local:SettingsCard.HeaderIcon>
+					<Grid MinWidth="{StaticResource SettingsCardContentMinWidth}">
+						<Grid.ColumnDefinitions>
+							<ColumnDefinition Width="*" />
+							<ColumnDefinition Width="Auto" />
+						</Grid.ColumnDefinitions>
+						<Slider Grid.Column="0"
+						        MinWidth="0"
+						        IsThumbToolTipEnabled="False"
+						        Maximum="{x:Bind ViewModel.MaxScalingWindowsLimit, Mode=OneTime}"
+						        Minimum="1"
+						        StepFrequency="1"
+						        TickFrequency="1"
+						        Value="{x:Bind ViewModel.MaxScalingWindows, Mode=TwoWay}" />
+						<TextBlock Grid.Column="1"
+						           Width="24"
+						           VerticalAlignment="Center"
+						           Text="{x:Bind ViewModel.MaxScalingWindowsText, Mode=OneWay}"
+						           TextAlignment="Right" />
+					</Grid>
 				</local:SettingsCard>
 				<local:SettingsCard x:Uid="Home_Advanced_SimulateExclusiveFullscreen">
 					<local:SettingsCard.HeaderIcon>

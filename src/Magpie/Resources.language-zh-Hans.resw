@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <root>
   <!-- 
     Microsoft ResX Schema 
@@ -793,6 +793,9 @@
   <data name="Message_ScalingFailed" xml:space="preserve">
     <value>缩放失败</value>
   </data>
+  <data name="Message_TooManyScalingWindows" xml:space="preserve">
+    <value>最多同时缩放 {} 个窗口，请先关闭一个正在缩放的窗口后重试。</value>
+  </data>
   <data name="Profile_Performance_NoGraphicsCard.Title" xml:space="preserve">
     <value>由于找不到兼容的显卡，将使用 CPU 渲染。很可能达不到理想性能。</value>
   </data>
@@ -801,6 +804,12 @@
   </data>
   <data name="Home_Advanced_MinFrameRate.Description" xml:space="preserve">
     <value>稳定 GPU 频率以减少卡顿，但会导致功耗增加</value>
+  </data>
+  <data name="Home_Advanced_MaxScalingWindows.Header" xml:space="preserve">
+    <value>同时缩放的窗口数</value>
+  </data>
+  <data name="Home_Advanced_MaxScalingWindows.Description" xml:space="preserve">
+    <value>每个缩放窗口会占用一条渲染线程和独立的显存，设置过大可能导致掉帧或显存不足</value>
   </data>
   <data name="Home_Advanced_DeveloperOptions_DisableFP16.Content" xml:space="preserve">
     <value>禁止在着色器中使用 FP16</value>
@@ -1062,5 +1071,32 @@
   </data>
   <data name="Home_Advanced_KeepScreenOn.Header" xml:space="preserve">
     <value>缩放期间保持屏幕常亮</value>
+  </data>
+  <data name="Home_Advanced_BackgroundRendering.Header" xml:space="preserve">
+    <value>后台保持渲染</value>
+  </data>
+  <data name="Home_Advanced_BackgroundRendering.Description" xml:space="preserve">
+    <value>允许把缩放画面最小化到后台：源窗口移到屏幕外继续运行，声音和渲染不中断，点击任务栏图标或 Alt+Tab 切回时恢复画面</value>
+  </data>
+  <data name="Home_Toolbar_BackgroundRendering.Header" xml:space="preserve">
+    <value>后台保持渲染快捷键</value>
+  </data>
+  <data name="Home_Toolbar_BackgroundRendering_ShortcutControl.Title" xml:space="preserve">
+    <value>后台保持渲染快捷键</value>
+  </data>
+  <data name="Overlay_Toolbar_BackgroundRendering" xml:space="preserve">
+    <value>后台保持渲染</value>
+  </data>
+  <data name="Overlay_Toolbar_MinimizeToBackground" xml:space="preserve">
+    <value>最小化到后台</value>
+  </data>
+  <data name="Message_BackgroundRenderingOn" xml:space="preserve">
+    <value>已开启后台保持渲染。</value>
+  </data>
+  <data name="Message_BackgroundRenderingOff" xml:space="preserve">
+    <value>已关闭后台保持渲染。</value>
+  </data>
+  <data name="Message_ParkedToBackground" xml:space="preserve">
+    <value>已切换到后台，程序继续运行。点击任务栏图标或按 Alt+Tab 切回即可恢复画面</value>
   </data>
 </root>

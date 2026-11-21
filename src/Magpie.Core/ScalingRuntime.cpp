@@ -100,6 +100,14 @@ void ScalingRuntime::TakeScreenshot() {
 	});
 }
 
+void ScalingRuntime::SetBackgroundRendering(bool value) {
+	_Dispatcher().TryEnqueue([value]() {
+		if (ScalingWindow& scalingWindow = ScalingWindow::Get()) {
+			scalingWindow.SetBackgroundRendering(value);
+		};
+	});
+}
+
 void ScalingRuntime::Stop() {
 	_Dispatcher().TryEnqueue([this]() {
 		ScalingWindow::Get().Stop();

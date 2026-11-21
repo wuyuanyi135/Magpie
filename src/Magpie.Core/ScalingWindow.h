@@ -101,6 +101,13 @@ public:
 
 	void TakeScreenshot() noexcept;
 
+	// 设置「后台保持渲染」。关闭时若画面已收起到后台则自动恢复
+	void SetBackgroundRendering(bool value) noexcept;
+
+	// 将缩放画面收起到后台：隐藏缩放窗口并把源窗口移到屏幕外（保持未最小化），
+	// 源窗口继续渲染和播放声音。源窗口重新激活时自动恢复（见 Render）
+	void ParkToBackground() noexcept;
+
 	void Render() noexcept;
 
 	const RECT& RendererRect() const noexcept {
@@ -184,6 +191,11 @@ private:
 		bool& isSrcRepositioning,
 		bool& srcFocusedChanged
 	) noexcept;
+
+	void RestoreFromBackground() noexcept;
+
+	// 将收起时移到屏幕外的源窗口移回原位。已最小化时改为修正其还原位置
+	void _UnparkSrcWindow() noexcept;
 
 	bool _CheckForegroundFor3DGameMode(HWND hwndFore) const noexcept;
 
@@ -281,6 +293,19 @@ private:
 	bool _shouldWaitForGpu = false;
 	bool _areResizeHelperWindowsVisible = false;
 	bool _isSrcRepositioning = false;
+
+	// 「后台保持渲染」：缩放画面是否已收起到后台（源窗口在屏幕外保持运行）
+	bool _isSrcParked = false;
+	// 收起前源窗口的位置（屏幕坐标），恢复时移回
+	RECT _srcRectBeforePark{};
+
+	// 诊断日志：渲染循环的心跳。光标状态机的更新挂在渲染循环上，循环停摆时光标会冻结，
+	// 因此必须能看出「哪一段没有渲染」
+	uint64_t _renderLoopCount = 0;
+	std::chrono::steady_clock::time_point _lastRenderLoopTime{};
+	std::chrono::steady_clock::time_point _lastRenderHeartbeatTime{};
+	bool _loggedSrcParked = false;
+	bool _loggedSrcFocused = false;
 };
 
 }

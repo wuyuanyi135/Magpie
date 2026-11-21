@@ -66,6 +66,7 @@ void ScalingOptions::Prepare() noexcept {
 	IsDebugMode: {}
 	IsBenchmarkMode: {}
 	IsTopmostDisabled: {}
+	IsBackgroundRendering: {}
 	IsFP16Disabled: {}
 	IsEffectCacheDisabled: {}
 	IsFontCacheDisabled: {}
@@ -101,6 +102,7 @@ void ScalingOptions::Prepare() noexcept {
 		IsDebugMode(),
 		IsBenchmarkMode(),
 		IsTopmostDisabled(),
+		IsBackgroundRendering(),
 		IsFP16Disabled(),
 		IsEffectCacheDisabled(),
 		IsFontCacheDisabled(),

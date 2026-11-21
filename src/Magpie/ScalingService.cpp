@@ -21,9 +21,9 @@ using winrt::Magpie::ShortcutAction;
 
 namespace Magpie {
 
-// 同时缩放的最大窗口数。每个缩放运行时占用一条线程和一整套 D3D/捕获资源，
-// 无上限时窗口数过多会导致显存与内存压力失控
-static constexpr uint32_t MAX_SCALING_WINDOWS = 4;
+// 同时缩放的最大窗口数由设置项控制（见 AppSettings::MaxScalingWindows）。
+// 每个缩放运行时占用一条线程和一整套 D3D/捕获资源，窗口数过多会导致显存
+// 与内存压力失控，因此仍需上限。
 
 // 定义于 Magpie.Core/CursorManager.cpp。Magpie 项目的包含目录只有
 // Magpie.Core/include，无法直接包含 CursorManager.h，因此前向声明。
@@ -56,8 +56,14 @@ void ScalingService::Initialize() {
 }
 
 void ScalingService::Uninitialize() noexcept {
-	_checkForegroundTimer.Stop();
-	_countDownTimer.Stop();
+	// 计时器在 Initialize 中创建，容忍未初始化就调用（如管理员自提升分支提前退出）
+	if (_checkForegroundTimer) {
+		_checkForegroundTimer.Stop();
+	}
+	if (_countDownTimer) {
+		_countDownTimer.Stop();
+	}
+
 	_runtimes.clear();
 
 	_shortcutActivatedRevoker.Revoke();
@@ -158,6 +164,11 @@ void ScalingService::_ShortcutService_ShortcutPressed(ShortcutAction action) {
 		}
 		break;	
 	}
+	case ShortcutAction::BackgroundRendering:
+	{
+		ToggleBackgroundRendering();
+		break;
+	}
 	default:
 		break;
 	}
@@ -223,6 +234,9 @@ static void ShowError(HWND hWnd, ScalingError error) noexcept {
 	case ScalingError::CreateFenceFailed:
 		key = L"Message_CreateFenceFailed";
 		break;
+	case ScalingError::TooManyScalingWindows:
+		key = L"Message_TooManyScalingWindows";
+		break;
 	default:
 		assert(false);
 		return;
@@ -230,7 +244,13 @@ static void ShowError(HWND hWnd, ScalingError error) noexcept {
 
 	LocalizationService& ls = LocalizationService::Get();
 	hstring title = isFail ? ls.GetLocalizedString(L"Message_ScalingFailed") : hstring{};
-	ToastService::Get().ShowMessageOnWindow(title, ls.GetLocalizedString(key), hWnd);
+	hstring message = ls.GetLocalizedString(key);
+	if (error == ScalingError::TooManyScalingWindows) {
+		// 该文案带有窗口数上限的占位符
+		message = fmt::format(fmt::runtime(std::wstring_view(message)),
+			AppSettings::Get().MaxScalingWindows()).c_str();
+	}
+	ToastService::Get().ShowMessageOnWindow(title, message, hWnd);
 	Logger::Get().Error(fmt::format("缩放失败\n\t错误码: {}", (int)error));
 }
 
@@ -389,6 +409,27 @@ ScalingRuntime* ScalingService::_ActiveRuntime() noexcept {
 	return nullptr;
 }
 
+void ScalingService::ToggleBackgroundRendering() noexcept {
+	AppSettings& settings = AppSettings::Get();
+	const bool newValue = !settings.IsBackgroundRendering();
+	settings.IsBackgroundRendering(newValue);
+
+	// 应用到所有正在缩放的窗口，由各缩放窗口自行提示
+	bool anyScaling = false;
+	for (auto& [hwnd, rt] : _runtimes) {
+		if (rt->State() == ScalingState::Scaling) {
+			anyScaling = true;
+		}
+		rt->SetBackgroundRendering(newValue);
+	}
+
+	if (!anyScaling) {
+		LocalizationService& ls = LocalizationService::Get();
+		ToastService::Get().ShowMessageInApp({}, ls.GetLocalizedString(
+			newValue ? L"Message_BackgroundRenderingOn" : L"Message_BackgroundRenderingOff"));
+	}
+}
+
 void ScalingService::_ScaleForegroundWindow(bool windowedMode, HWND hWnd) {
 	if (!hWnd) {
 		hWnd = GetForegroundWindow();
@@ -427,10 +468,12 @@ ScalingError ScalingService::_StartScaleImpl(HWND hWnd, const Profile& profile, 
 				++scalingCount;
 			}
 		}
-		if (scalingCount >= MAX_SCALING_WINDOWS) {
+
+		const uint32_t maxScalingWindows = AppSettings::Get().MaxScalingWindows();
+		if (scalingCount >= maxScalingWindows) {
 			Logger::Get().Error(fmt::format("已达同时缩放窗口数上限 {}，拒绝缩放新窗口",
-				MAX_SCALING_WINDOWS));
-			return ScalingError::ScalingFailedGeneral;
+				maxScalingWindows));
+			return ScalingError::TooManyScalingWindows;
 		}
 	}
 
@@ -558,6 +601,7 @@ ScalingError ScalingService::_StartScaleImpl(HWND hWnd, const Profile& profile, 
 	options.IsDebugMode(settings.IsDebugMode());
 	options.IsBenchmarkMode(settings.IsBenchmarkMode());
 	options.IsTopmostDisabled(settings.IsTopmostDisabled());
+	options.IsBackgroundRendering(settings.IsBackgroundRendering());
 	options.IsEffectCacheDisabled(settings.IsEffectCacheDisabled());
 	options.IsFontCacheDisabled(settings.IsFontCacheDisabled());
 	options.IsSaveEffectSources(settings.IsSaveEffectSources());

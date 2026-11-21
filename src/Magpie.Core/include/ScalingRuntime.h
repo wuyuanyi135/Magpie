@@ -22,6 +22,8 @@ public:
 
 	void TakeScreenshot();
 
+	void SetBackgroundRendering(bool value);
+
 	void Stop();
 
 	ScalingState State() const noexcept {

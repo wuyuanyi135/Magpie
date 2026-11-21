@@ -752,6 +752,21 @@ bool OverlayDrawer::_DrawToolbar(uint32_t fps, int& itemId) noexcept {
 		ImGui::SameLine();
 		const std::string& profilerStr = _GetResourceString(L"Overlay_Toolbar_Profiler");
 		drawToggleButton(_isProfilerVisible, OverlayHelper::SegoeIcons::Diagnostic, profilerStr.c_str());
+		ImGui::SameLine();
+		{
+			// 「后台保持渲染」开关。drawToggleButton 需要左值引用翻转，这里用本地
+			// 变量承接状态，点击后以“设置目标值”的语义入队应用，避免 Draw 的多次
+			// 迭代重复入队导致状态抖动
+			const bool backgroundRendering = ScalingWindow::Get().Options().IsBackgroundRendering();
+			const std::string& backgroundRenderingStr = _GetResourceString(L"Overlay_Toolbar_BackgroundRendering");
+			bool value = backgroundRendering;
+			drawToggleButton(value, OverlayHelper::SegoeIcons::Play, backgroundRenderingStr.c_str());
+			if (value != backgroundRendering) {
+				ScalingWindow::Dispatcher().TryEnqueue([newValue(!backgroundRendering)]() {
+					ScalingWindow::Get().SetBackgroundRendering(newValue);
+				});
+			}
+		}
 #ifdef _DEBUG
 		ImGui::SameLine();
 		const std::string& demoStr = _GetResourceString(L"Overlay_Toolbar_Demo");
@@ -847,20 +862,30 @@ bool OverlayDrawer::_DrawToolbar(uint32_t fps, int& itemId) noexcept {
 		ImGui::SameLine();
 		ImGui::SetCursorPosY((CORNER_ROUNDING + 3) * _dpiScale);
 
-		// 源窗口支持最小化时才显示最小化按钮
+		// 源窗口支持最小化或已开启后台保持渲染时才显示最小化按钮
 		const HWND hwndSrc = ScalingWindow::Get().SrcTracker().Handle();
-		const bool canSrcMinimized = GetWindowStyle(hwndSrc) & WS_MINIMIZEBOX;
+		const bool isBackgroundRendering = ScalingWindow::Get().Options().IsBackgroundRendering();
+		const bool canSrcMinimized =
+			isBackgroundRendering || (GetWindowStyle(hwndSrc) & WS_MINIMIZEBOX);
 		ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x -
 			((canSrcMinimized ? 3 : 2) * 28 - 4) * _dpiScale);
 
 		if (canSrcMinimized) {
-			const std::string& minimizeStr = _GetResourceString(L"Overlay_Toolbar_Minimize");
+			const std::string& minimizeStr = _GetResourceString(isBackgroundRendering
+				? L"Overlay_Toolbar_MinimizeToBackground" : L"Overlay_Toolbar_Minimize");
 			const ImWchar icon = Win32Helper::GetOSVersion().IsWin11() ?
 				OverlayHelper::SegoeIcons::CheckboxIndeterminate : OverlayHelper::SegoeIcons::Remove;
 			if (drawButton(icon, minimizeStr.c_str())) {
-				// 模拟通过标题栏最小化，失败则回落到 ShowWindow
-				if (!PostMessage(hwndSrc, WM_SYSCOMMAND, SC_MINIMIZE, 0)) {
-					ShowWindowAsync(hwndSrc, SW_SHOWMINIMIZED);
+				if (isBackgroundRendering) {
+					// 收起到后台：隐藏画面，源窗口在屏幕外继续运行
+					ScalingWindow::Dispatcher().TryEnqueue([]() {
+						ScalingWindow::Get().ParkToBackground();
+					});
+				} else {
+					// 模拟通过标题栏最小化，失败则回落到 ShowWindow
+					if (!PostMessage(hwndSrc, WM_SYSCOMMAND, SC_MINIMIZE, 0)) {
+						ShowWindowAsync(hwndSrc, SW_SHOWMINIMIZED);
+					}
 				}
 			}
 			ImGui::SameLine();

@@ -41,6 +41,9 @@ public:
 
 	bool IsScaling() const noexcept;
 
+	// 切换「后台保持渲染」：更新全局设置并应用到所有正在缩放的窗口
+	void ToggleBackgroundRendering() noexcept;
+
 	// 强制重新检查前台窗口
 	void CheckForeground();
 

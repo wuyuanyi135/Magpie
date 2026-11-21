@@ -396,6 +396,21 @@ void AppSettings::CountdownSeconds(uint32_t value) noexcept {
 	SaveAsync();
 }
 
+void AppSettings::MaxScalingWindows(uint32_t value) noexcept {
+	if (value < 1) {
+		value = 1;
+	} else if (value > MAX_SCALING_WINDOWS_LIMIT) {
+		value = MAX_SCALING_WINDOWS_LIMIT;
+	}
+
+	if (_maxScalingWindows == value) {
+		return;
+	}
+
+	_maxScalingWindows = value;
+	SaveAsync();
+}
+
 void AppSettings::IsDeveloperMode(bool value) noexcept {
 	_isDeveloperMode = value;
 	if (!value) {
@@ -613,10 +628,14 @@ rapidjson::StringBuffer AppSettings::_WriteConfigJson() const noexcept {
 	writer.Uint(EncodeShortcut(_shortcuts[(size_t)ShortcutAction::Toolbar]));
 	writer.Key("takeScreenshot");
 	writer.Uint(EncodeShortcut(_shortcuts[(size_t)ShortcutAction::TakeScreenshot]));
+	writer.Key("backgroundRendering");
+	writer.Uint(EncodeShortcut(_shortcuts[(size_t)ShortcutAction::BackgroundRendering]));
 	writer.EndObject();
 
 	writer.Key("countdownSeconds");
 	writer.Uint(_countdownSeconds);
+	writer.Key("maxScalingWindows");
+	writer.Uint(_maxScalingWindows);
 	writer.Key("developerMode");
 	writer.Bool(_isDeveloperMode);
 	writer.Key("debugMode");
@@ -625,6 +644,8 @@ rapidjson::StringBuffer AppSettings::_WriteConfigJson() const noexcept {
 	writer.Bool(_isBenchmarkMode);
 	writer.Key("disableTopmost");
 	writer.Bool(_isTopmostDisabled);
+	writer.Key("backgroundRendering");
+	writer.Bool(_isBackgroundRendering);
 	writer.Key("disableEffectCache");
 	writer.Bool(_isEffectCacheDisabled);
 	writer.Key("disableFontCache");
@@ -810,6 +831,11 @@ void AppSettings::_LoadSettings(const rapidjson::GenericObject<true, rapidjson::
 		if (takeScreenshotNode != shortcutsObj.MemberEnd() && takeScreenshotNode->value.IsUint()) {
 			DecodeShortcut(takeScreenshotNode->value.GetUint(), _shortcuts[(size_t)ShortcutAction::TakeScreenshot]);
 		}
+
+		auto backgroundRenderingNode = shortcutsObj.FindMember("backgroundRendering");
+		if (backgroundRenderingNode != shortcutsObj.MemberEnd() && backgroundRenderingNode->value.IsUint()) {
+			DecodeShortcut(backgroundRenderingNode->value.GetUint(), _shortcuts[(size_t)ShortcutAction::BackgroundRendering]);
+		}
 	}
 
 	if (!JsonHelper::ReadUInt(root, "countdownSeconds", _countdownSeconds, true)) {
@@ -819,10 +845,15 @@ void AppSettings::_LoadSettings(const rapidjson::GenericObject<true, rapidjson::
 	if (_countdownSeconds == 0 || _countdownSeconds > 5) {
 		_countdownSeconds = 3;
 	}
+	JsonHelper::ReadUInt(root, "maxScalingWindows", _maxScalingWindows);
+	if (_maxScalingWindows < 1 || _maxScalingWindows > MAX_SCALING_WINDOWS_LIMIT) {
+		_maxScalingWindows = DEFAULT_MAX_SCALING_WINDOWS;
+	}
 	JsonHelper::ReadBool(root, "developerMode", _isDeveloperMode);
 	JsonHelper::ReadBool(root, "debugMode", _isDebugMode);
 	JsonHelper::ReadBool(root, "benchmarkMode", _isBenchmarkMode);
 	JsonHelper::ReadBool(root, "disableTopmost", _isTopmostDisabled);
+	JsonHelper::ReadBool(root, "backgroundRendering", _isBackgroundRendering);
 	JsonHelper::ReadBool(root, "disableEffectCache", _isEffectCacheDisabled);
 	JsonHelper::ReadBool(root, "disableFontCache", _isFontCacheDisabled);
 	JsonHelper::ReadBool(root, "saveEffectSources", _isSaveEffectSources);
@@ -1148,6 +1179,15 @@ bool AppSettings::_SetDefaultShortcuts() noexcept {
 		takeScreenshotShortcut.alt = true;
 		takeScreenshotShortcut.shift = true;
 		takeScreenshotShortcut.code = 'S';
+
+		changed = true;
+	}
+
+	Shortcut& backgroundRenderingShortcut = _shortcuts[(size_t)ShortcutAction::BackgroundRendering];
+	if (backgroundRenderingShortcut.IsEmpty()) {
+		backgroundRenderingShortcut.alt = true;
+		backgroundRenderingShortcut.shift = true;
+		backgroundRenderingShortcut.code = 'B';
 
 		changed = true;
 	}

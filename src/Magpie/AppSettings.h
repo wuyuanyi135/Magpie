@@ -76,6 +76,17 @@ public:
 
 	void CountdownSeconds(uint32_t value) noexcept;
 
+	// 同时缩放的窗口数上限的允许范围。每个缩放窗口占用一条渲染线程和独立的
+	// D3D 设备与显存，上限过高会导致掉帧或显存不足
+	static constexpr uint32_t MAX_SCALING_WINDOWS_LIMIT = 16;
+	static constexpr uint32_t DEFAULT_MAX_SCALING_WINDOWS = 8;
+
+	uint32_t MaxScalingWindows() const noexcept {
+		return _maxScalingWindows;
+	}
+
+	void MaxScalingWindows(uint32_t value) noexcept;
+
 	bool IsDeveloperMode() const noexcept {
 		return _isDeveloperMode;
 	}
@@ -106,6 +117,16 @@ public:
 
 	void IsTopmostDisabled(bool value) noexcept {
 		_isTopmostDisabled = value;
+		SaveAsync();
+	}
+
+	// 允许把缩放画面最小化到后台：源窗口移到屏幕外继续运行，声音和渲染不中断
+	bool IsBackgroundRendering() const noexcept {
+		return _isBackgroundRendering;
+	}
+
+	void IsBackgroundRendering(bool value) noexcept {
+		_isBackgroundRendering = value;
 		SaveAsync();
 	}
 
@@ -340,6 +361,8 @@ private:
 	AppTheme _theme = AppTheme::System;
 	// 必须在 1~5 之间
 	uint32_t _countdownSeconds = 3;
+	// 必须在 1~MAX_SCALING_WINDOWS_LIMIT 之间
+	uint32_t _maxScalingWindows = DEFAULT_MAX_SCALING_WINDOWS;
 
 	// 上一次自动检查更新的日期
 	std::chrono::system_clock::time_point _updateCheckDate;
@@ -363,6 +386,7 @@ private:
 	bool _isDebugMode = false;
 	bool _isBenchmarkMode = false;
 	bool _isTopmostDisabled = false;
+	bool _isBackgroundRendering = false;
 	bool _isEffectCacheDisabled = false;
 	bool _isFontCacheDisabled = false;
 	bool _isSaveEffectSources = false;

@@ -32,6 +32,10 @@ namespace Magpie {
 
 		Boolean IsAllowScalingMaximized;
 		Boolean IsKeepScreenOn;
+		Boolean IsBackgroundRendering;
+		UInt32 MaxScalingWindows;
+		UInt32 MaxScalingWindowsLimit { get; };
+		String MaxScalingWindowsText { get; };
 		Boolean IsSimulateExclusiveFullscreen;
 		Boolean IsInlineParams;
 		static IVector<IInspectable> MinFrameRateOptions { get; };

@@ -347,6 +347,45 @@ void HomeViewModel::IsKeepScreenOn(bool value) {
 	RaisePropertyChanged(L"IsKeepScreenOn");
 }
 
+bool HomeViewModel::IsBackgroundRendering() const noexcept {
+	return AppSettings::Get().IsBackgroundRendering();
+}
+
+void HomeViewModel::IsBackgroundRendering(bool value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.IsBackgroundRendering() == value) {
+		return;
+	}
+
+	settings.IsBackgroundRendering(value);
+	RaisePropertyChanged(L"IsBackgroundRendering");
+}
+
+uint32_t HomeViewModel::MaxScalingWindows() const noexcept {
+	return AppSettings::Get().MaxScalingWindows();
+}
+
+void HomeViewModel::MaxScalingWindows(uint32_t value) {
+	AppSettings& settings = AppSettings::Get();
+
+	if (settings.MaxScalingWindows() == value) {
+		return;
+	}
+
+	settings.MaxScalingWindows(value);
+	RaisePropertyChanged(L"MaxScalingWindows");
+	RaisePropertyChanged(L"MaxScalingWindowsText");
+}
+
+uint32_t HomeViewModel::MaxScalingWindowsLimit() const noexcept {
+	return AppSettings::MAX_SCALING_WINDOWS_LIMIT;
+}
+
+hstring HomeViewModel::MaxScalingWindowsText() const noexcept {
+	return to_hstring(MaxScalingWindows());
+}
+
 bool HomeViewModel::IsSimulateExclusiveFullscreen() const noexcept {
 	return AppSettings::Get().IsSimulateExclusiveFullscreen();
 }

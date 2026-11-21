@@ -3,6 +3,7 @@
 #include "CommonSharedConstants.h"
 #include "CursorManager.h"
 #include "ExclModeHelper.h"
+#include "LocalizationService.h"
 #include "Logger.h"
 #include "Renderer.h"
 #include "Win32Helper.h"
@@ -380,6 +381,9 @@ void ScalingWindow::Start(HWND hwndSrc, ScalingOptions&& options) noexcept {
 	_options = std::move(options);
 	_options.Prepare();
 
+	// 重新缩放时后台状态不应保留
+	_isSrcParked = false;
+
 	ScalingError error = _StartImpl(hwndSrc);
 	if (error != ScalingError::NoError) {
 		_options.showError(hwndSrc, error);
@@ -425,17 +429,183 @@ void ScalingWindow::TakeScreenshot() noexcept {
 	}
 }
 
+void ScalingWindow::SetBackgroundRendering(bool value) noexcept {
+	if (_options.IsBackgroundRendering() == value) {
+		return;
+	}
+
+	_options.IsBackgroundRendering(value);
+
+	LocalizationService& ls = LocalizationService::Get();
+	ShowToast(ls.GetLocalizedString(
+		value ? L"Message_BackgroundRenderingOn" : L"Message_BackgroundRenderingOff"));
+
+	// 关闭时若画面已收起到后台则恢复
+	if (!value && _isSrcParked) {
+		RestoreFromBackground();
+	}
+}
+
+void ScalingWindow::ParkToBackground() noexcept {
+	if (_isSrcParked || !Handle() || !_renderer) {
+		return;
+	}
+
+	const HWND hwndSrc = _srcTracker.Handle();
+	if (!IsWindow(hwndSrc) || _srcTracker.IsZoomed()) {
+		return;
+	}
+
+	// 退出捕获状态并恢复系统光标
+	_cursorManager->OnPark();
+
+	_srcRectBeforePark = _srcTracker.WindowRect();
+
+	// 将源窗口移到所有屏幕的右侧之外。Move 会同步移动源窗口并更新缓存矩形，
+	// 因此不会触发 _UpdateSrcState 的矩形变化检测
+	const int virtualScreenRight =
+		GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+	const RECT& curRect = _srcTracker.WindowRect();
+	if (!_srcTracker.Move(virtualScreenRight + 64 - curRect.left, 0, false)) {
+		return;
+	}
+
+	_isSrcParked = true;
+
+	// 隐藏缩放窗口和辅助窗口
+	ShowWindow(Handle(), SW_HIDE);
+	for (wil::unique_hwnd& hWnd : _hwndResizeHelpers) {
+		if (hWnd) {
+			ShowWindow(hWnd.get(), SW_HIDE);
+		}
+	}
+	_areResizeHelperWindowsVisible = false;
+	for (wil::unique_hwnd& hWnd : _hwndTouchHoles) {
+		if (hWnd) {
+			ShowWindow(hWnd.get(), SW_HIDE);
+		}
+	}
+
+	LocalizationService& ls = LocalizationService::Get();
+	ShowToast(ls.GetLocalizedString(L"Message_ParkedToBackground"));
+
+	Logger::Get().Info("已收起到后台，源窗口保持运行");
+}
+
+void ScalingWindow::RestoreFromBackground() noexcept {
+	if (!_isSrcParked) {
+		return;
+	}
+	_isSrcParked = false;
+
+	_UnparkSrcWindow();
+
+	// 重新显示缩放窗口，置顶状态由 _UpdateFocusStateAsync 重申
+	SetWindowPos(Handle(), NULL, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+	if (_options.IsWindowedMode()) {
+		_RepostionBorderHelperWindows();
+	}
+
+	if (_options.IsTouchSupportEnabled()) {
+		_UpdateTouchHoleWindows(false);
+	}
+
+	_UpdateFocusStateAsync();
+
+	Logger::Get().Info("已从后台恢复");
+}
+
+void ScalingWindow::_UnparkSrcWindow() noexcept {
+	const HWND hwndSrc = _srcTracker.Handle();
+	if (!IsWindow(hwndSrc)) {
+		return;
+	}
+
+	if (IsIconic(hwndSrc)) {
+		// 收起期间源窗口被最小化时无法移动，此时修正其还原位置，确保用户还原
+		// 窗口时它不会停留在屏幕外。rcNormalPosition 使用工作区坐标，和 OS 的
+		// 处理保持一致，见 SrcTracker::UpdateState 中的注释
+		WINDOWPLACEMENT wp{ sizeof(wp) };
+		const HMONITOR hMon = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
+		MONITORINFO mi{ sizeof(mi) };
+		if (GetWindowPlacement(hwndSrc, &wp) && GetMonitorInfo(hMon, &mi)) {
+			wp.rcNormalPosition = _srcRectBeforePark;
+			Win32Helper::OffsetRect(
+				wp.rcNormalPosition,
+				mi.rcMonitor.left - mi.rcWork.left,
+				mi.rcMonitor.top - mi.rcWork.top
+			);
+			SetWindowPlacement(hwndSrc, &wp);
+		}
+		return;
+	}
+
+	const RECT& curRect = _srcTracker.WindowRect();
+	_srcTracker.Move(
+		_srcRectBeforePark.left - curRect.left,
+		_srcRectBeforePark.top - curRect.top,
+		false
+	);
+}
+
 void ScalingWindow::Render() noexcept {
+	// 渲染循环心跳：光标状态机每帧在 _cursorManager->Update() 中更新，循环一旦停摆光标会
+	// 冻结在最后一帧。记录调用间隔，日志里出现空白时才能区分「没有事件」和「没有渲染」
+	const auto renderNow = std::chrono::steady_clock::now();
+	++_renderLoopCount;
+	if (_lastRenderLoopTime != std::chrono::steady_clock::time_point{}) {
+		const auto gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+			renderNow - _lastRenderLoopTime).count();
+		if (gapMs >= 1000) {
+			Logger::Get().Info(fmt::format(
+				"渲染循环中断 {} ms 后恢复（第 {} 次渲染调用）", gapMs, _renderLoopCount));
+		}
+	}
+	_lastRenderLoopTime = renderNow;
+
+	const bool renderHeartbeat =
+		renderNow - _lastRenderHeartbeatTime >= std::chrono::seconds(10);
+	if (renderHeartbeat) {
+		_lastRenderHeartbeatTime = renderNow;
+	}
+
 	bool isSrcRepositioning = false;
 	bool srcFocusedChanged = false;
 	if (!_UpdateSrcState(isSrcRepositioning, srcFocusedChanged)) {
-		Logger::Get().Info("源窗口状态改变");
+		Logger::Get().Info(fmt::format(
+			"源窗口状态改变，结束本次缩放（重新定位={}，源窗口在前台={}，渲染器={}）",
+			isSrcRepositioning, _srcTracker.IsFocused(), _renderer != nullptr));
 		_DelayedStop(false, isSrcRepositioning);
 		return;
 	}
 
-	if (srcFocusedChanged) {
+	if (_isSrcParked) {
+		// 缩放画面已收起到后台：源窗口被激活（点击任务栏图标、Alt+Tab 切回等）
+		// 时自动恢复画面，其余时间跳过渲染以节省资源。源窗口被最小化则走上方
+		// 的等待-重启路径
+		if (!_srcTracker.IsFocused()) {
+			if (renderHeartbeat) {
+				Logger::Get().Info(fmt::format(
+					"渲染心跳: 第 {} 次渲染调用，画面已收起到后台且源窗口不在前台，跳过渲染与光标更新",
+					_renderLoopCount));
+			}
+			return;
+		}
+
+		RestoreFromBackground();
+	} else if (srcFocusedChanged) {
+		Logger::Get().Info(fmt::format("源窗口焦点变为{}，更新缩放窗口层级",
+			_srcTracker.IsFocused() ? "前台" : "后台"));
 		_UpdateFocusStateAsync();
+	}
+
+	if (renderHeartbeat) {
+		Logger::Get().Info(fmt::format(
+			"渲染心跳: 第 {} 次渲染调用，源窗口在前台={}，收起={}，渲染器={}，缩放窗口可见={}，可调整大小/移动={}",
+			_renderLoopCount, _srcTracker.IsFocused(), _isSrcParked, _renderer != nullptr,
+			IsWindowVisible(Handle()) != FALSE, _isResizingOrMoving));
 	}
 
 	// 虽然可以在第一帧渲染完成后再隐藏系统光标，但某些设备上显示窗口时光标状态会变成忙，
@@ -455,6 +625,12 @@ void ScalingWindow::RestartAfterSrcRepositioned() noexcept {
 }
 
 void ScalingWindow::CleanAfterSrcRepositioned() noexcept {
+	// 若画面已收起到后台，必须先把源窗口移回屏幕内，避免用户找不到窗口
+	if (_isSrcParked) {
+		_isSrcParked = false;
+		_UnparkSrcWindow();
+	}
+
 	if (_options.save) {
 		_options = {};
 	}
@@ -1342,8 +1518,9 @@ bool ScalingWindow::_UpdateSrcState(
 		hwndFore = GetForegroundWindow();
 	}
 
-	// 在 3D 游戏模式下需检测前台窗口变化
-	if (_options.Is3DGameMode() && !_CheckForegroundFor3DGameMode(hwndFore)) {
+	// 在 3D 游戏模式下需检测前台窗口变化。收起到后台时用户使用其他窗口是预期
+	// 行为，应跳过此检测
+	if (_options.Is3DGameMode() && !_isSrcParked && !_CheckForegroundFor3DGameMode(hwndFore)) {
 		return false;
 	}
 
@@ -1916,6 +2093,13 @@ void ScalingWindow::_UpdateFrameMargins() const noexcept {
 }
 
 winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
+	// 切换前台窗口后缩放窗口的层级的最终结果决定光标能否被捕获：如果缩放窗口被源窗口
+	// 盖住，WindowFromPoint 会命中源窗口，光标状态机会判定「缩放窗口被遮挡」
+	Logger::Get().Info(fmt::format(
+		"焦点更新开始: 源窗口在前台={}，缩放窗口置顶={}，前台窗口=0x{:X}",
+		_srcTracker.IsFocused(), IsTopmostWindow(Handle()) != FALSE,
+		(uintptr_t)GetForegroundWindow()));
+
 	if (_options.IsWindowedMode()) {
 		// 根据源窗口状态绘制非客户区，我们必须自己控制非客户区是绘制成焦点状态还是非焦点
 		// 状态，因为缩放窗口实际上永远不会得到焦点。
@@ -1938,6 +2122,8 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 
 		const bool oldTopmost = IsTopmostWindow(Handle());
 		const bool newTopmost = _CalcTopmostState();
+		Logger::Get().Info(fmt::format("焦点更新: 置顶状态 {} -> {}",
+			oldTopmost, newTopmost));
 		if (oldTopmost != newTopmost) {
 			if (newTopmost) {
 				for (int i = 0; i < 10; ++i) {
@@ -1960,6 +2146,7 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 				HWND hwndFore = GetForegroundWindow();
 				if (!hwndFore) {
 					// 切换窗口时有一个瞬间无前台窗口，这里等待切换完成
+					Logger::Get().Info("焦点更新: 当前无前台窗口（正在切换），等待 1ms 后重试");
 					co_await winrt::resume_after(1ms);
 					isInBackground = true;
 					hwndFore = GetForegroundWindow();
@@ -1970,6 +2157,10 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 					DWORD windowIL;
 					isForeMovable = Win32Helper::GetWindowIntegrityLevel(hwndFore, windowIL) &&
 						windowIL <= Win32Helper::GetCurrentProcessIntegrityLevel();
+					Logger::Get().Info(fmt::format(
+						"焦点更新: 前台窗口=0x{:X}，完整性级别可移动={}（前台上移方式={}）",
+						(uintptr_t)hwndFore, isForeMovable,
+						isForeMovable ? "将缩放窗口置于源窗口之前" : "先置源窗口再恢复前台窗口"));
 				}
 				
 				if (!isForeMovable) {
@@ -2033,6 +2224,12 @@ winrt::fire_and_forget ScalingWindow::_UpdateFocusStateAsync() const noexcept {
 		// lParam 传 1 表示转到后台而非结束缩放
 		PostMessage(HWND_BROADCAST, WM_MAGPIE_SCALINGCHANGED, 0, 1);
 	}
+
+	Logger::Get().Info(fmt::format(
+		"焦点更新结束: 缩放窗口置顶={}，紧邻源窗口之前={}，源窗口在前台={}，源窗口被遮挡判定依赖这些层级",
+		IsTopmostWindow(Handle()) != FALSE,
+		GetWindow(_srcTracker.Handle(), GW_HWNDPREV) == Handle(),
+		_srcTracker.IsFocused()));
 }
 
 bool ScalingWindow::_CalcTopmostState() const noexcept {

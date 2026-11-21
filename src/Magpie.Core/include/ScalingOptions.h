@@ -147,7 +147,9 @@ enum class ScalingError {
 	// FrameSource 初始化失败
 	CaptureFailed,
 	// ID3D11Device5::CreateFence 失败
-	CreateFenceFailed
+	CreateFenceFailed,
+	// 同时缩放的窗口数已达上限
+	TooManyScalingWindows
 };
 
 enum class ScalingFlags : uint32_t {
@@ -172,7 +174,9 @@ enum class ScalingFlags : uint32_t {
 	DisableFP16 = 1 << 16,
 	BenchmarkMode = 1 << 17,
 	DeveloperMode = 1 << 18,
-	DisableTopmost = 1 << 19
+	DisableTopmost = 1 << 19,
+	// 允许把缩放画面最小化到后台：源窗口移到屏幕外继续运行，声音和渲染不中断
+	BackgroundRendering = 1 << 20
 };
 DEFINE_ENUM_FLAG_OPERATORS(ScalingFlags)
 
@@ -197,6 +201,7 @@ struct ScalingOptions {
 	DEFINE_FLAG_ACCESSOR(IsBenchmarkMode, ScalingFlags::BenchmarkMode, flags)
 	DEFINE_FLAG_ACCESSOR(IsDeveloperMode, ScalingFlags::DeveloperMode, flags)
 	DEFINE_FLAG_ACCESSOR(IsTopmostDisabled, ScalingFlags::DisableTopmost, flags)
+	DEFINE_FLAG_ACCESSOR(IsBackgroundRendering, ScalingFlags::BackgroundRendering, flags)
 
 	std::vector<EffectOption> effects;
 	ScalingFlags flags = ScalingFlags::AdjustCursorSpeed;

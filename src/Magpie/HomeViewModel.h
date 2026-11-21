@@ -72,6 +72,16 @@ struct HomeViewModel : HomeViewModelT<HomeViewModel>, wil::notify_property_chang
 	bool IsKeepScreenOn() const noexcept;
 	void IsKeepScreenOn(bool value);
 
+	bool IsBackgroundRendering() const noexcept;
+	void IsBackgroundRendering(bool value);
+
+	uint32_t MaxScalingWindows() const noexcept;
+	void MaxScalingWindows(uint32_t value);
+
+	uint32_t MaxScalingWindowsLimit() const noexcept;
+
+	hstring MaxScalingWindowsText() const noexcept;
+
 	bool IsSimulateExclusiveFullscreen() const noexcept;
 	void IsSimulateExclusiveFullscreen(bool value);
 

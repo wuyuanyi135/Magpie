@@ -4,6 +4,7 @@ namespace Magpie {
 		WindowedModeScale,
 		Toolbar,
 		TakeScreenshot,
+		BackgroundRendering,
 		COUNT_OR_NONE
 	};
 
