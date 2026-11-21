@@ -1,7 +1,7 @@
 [settings]
 os=Windows
 compiler=msvc
-compiler.version=195
+compiler.version=194
 compiler.runtime=static
 compiler.cppstd=17
 
